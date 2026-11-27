@@ -11,3 +11,7 @@ updates:
   - package-ecosystem: docker
     directories: [/app/gateway, /app/mock-llm]
     schedule: { interval: weekly }
+    # Stay on the tested Python minor version; a jump to 3.15 failed CI (PRs #2 and #4). Patch bumps still come.
+    ignore:
+      - dependency-name: "python"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
