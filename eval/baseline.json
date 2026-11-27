@@ -1,7 +1,7 @@
 {
-  "tuned":     {"false_positive": 0,  "false_negative_pii": 0, "false_negative_injection": 2},
-  "fresh":     {"false_positive": 0,  "false_negative_pii": 0, "false_negative_injection": 2},
-  "multiturn": {"false_positive": 0,  "false_negative_pii": 0, "false_negative_injection": 1},
-  "review":    {"false_positive": 21, "false_negative_pii": 0, "false_negative_injection": 15},
-  "all":       {"false_positive": 21, "false_negative_pii": 0, "false_negative_injection": 20}
+  "tuned":     {"false_positive": 0, "false_negative_pii": 0, "false_negative_injection": 2},
+  "fresh":     {"false_positive": 0, "false_negative_pii": 0, "false_negative_injection": 2},
+  "multiturn": {"false_positive": 0, "false_negative_pii": 0, "false_negative_injection": 1},
+  "review":    {"false_positive": 3, "false_negative_pii": 0, "false_negative_injection": 6},
+  "all":       {"false_positive": 3, "false_negative_pii": 0, "false_negative_injection": 11}
 }
