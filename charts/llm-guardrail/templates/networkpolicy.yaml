@@ -1,0 +1,139 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- if and .Values.networkPolicy.externalLLM.enabled (not .Values.networkPolicy.externalLLM.cidrs) }}
+{{- fail "networkPolicy.externalLLM.enabled=true needs networkPolicy.externalLLM.cidrs (NetworkPolicy matches IPs, not hostnames)" }}
+{{- end }}
+# 1. Default deny: nothing in this namespace may send or receive traffic unless a policy below allows it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-default-deny
+  labels:
+    {{- include "llm-guardrail.labels" . | nindent 4 }}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+# 2. Who may call the gateway: allowed namespaces (e.g. the ingress controller) and
+#    pods in this namespace labelled guardrail-client=true (e.g. the helm test pod).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-gateway-ingress
+  labels:
+    {{- include "llm-guardrail.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "llm-guardrail.gatewaySelector" . | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        {{- range .Values.networkPolicy.allowedNamespaces }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . }}
+        {{- end }}
+        - podSelector:
+            matchLabels:
+              guardrail-client: "true"
+      ports:
+        - protocol: TCP
+          port: {{ .Values.gateway.port }}
+---
+# 3. Where the gateway may connect: DNS, plus the mock LLM or an allowlisted external CIDR.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-gateway-egress
+  labels:
+    {{- include "llm-guardrail.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "llm-guardrail.gatewaySelector" . | nindent 6 }}
+  policyTypes: [Egress]
+  egress:
+    {{- if .Values.networkPolicy.allowDns }}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    {{- end }}
+    {{- if .Values.mockLlm.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "llm-guardrail.mockSelector" . | nindent 14 }}
+      ports:
+        - { protocol: TCP, port: 8080 }
+    {{- end }}
+    {{- if .Values.networkPolicy.externalLLM.enabled }}
+    - to:
+        {{- range .Values.networkPolicy.externalLLM.cidrs }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
+      ports:
+        - { protocol: TCP, port: {{ .Values.networkPolicy.externalLLM.port }} }
+    {{- end }}
+{{- if .Values.mockLlm.enabled }}
+---
+# 4. The mock LLM only accepts traffic from the gateway.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-mock-llm-ingress
+  labels:
+    {{- include "llm-guardrail.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "llm-guardrail.mockSelector" . | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "llm-guardrail.gatewaySelector" . | nindent 14 }}
+      ports:
+        - { protocol: TCP, port: 8080 }
+{{- end }}
+---
+# 5. Client pods (label guardrail-client=true) may reach the gateway and DNS, nothing else.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-client-egress
+  labels:
+    {{- include "llm-guardrail.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      guardrail-client: "true"
+  policyTypes: [Egress]
+  egress:
+    {{- if .Values.networkPolicy.allowDns }}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    {{- end }}
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "llm-guardrail.gatewaySelector" . | nindent 14 }}
+      ports:
+        - { protocol: TCP, port: {{ .Values.gateway.port }} }
+{{- end }}

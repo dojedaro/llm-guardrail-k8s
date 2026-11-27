@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-policy
+  labels:
+    {{- include "llm-guardrail.labels" . | nindent 4 }}
+data:
+  policy.yaml: |
+    {{- toYaml .Values.policy | nindent 4 }}

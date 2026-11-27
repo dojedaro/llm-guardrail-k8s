@@ -1,0 +1,19 @@
+# Air-gapped site: images come from a private registry, no traffic leaves the cluster.
+# Used by scripts/airgap-install.sh, which overrides global.imageRegistry with the
+# registry it started. Edit the registry host to match the customer's registry.
+global:
+  imageRegistry: "registry.local:5000"
+
+gateway:
+  image:
+    pullPolicy: IfNotPresent
+  upstream:
+    kind: mock # no external LLM reachable from an air-gapped site
+
+mockLlm:
+  enabled: true
+
+networkPolicy:
+  enabled: true
+  externalLLM:
+    enabled: false # keep egress closed

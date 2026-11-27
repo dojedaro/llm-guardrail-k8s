@@ -1,0 +1,88 @@
+# Default values: runs fully in-cluster with the mock LLM (no API key, no internet).
+
+global:
+  # Prefix for every image, e.g. "registry.customer.local:5000". Leave empty for Docker Hub / local images.
+  imageRegistry: ""
+
+gateway:
+  image:
+    repository: llm-guardrail/gateway
+    tag: "0.1.0"
+    pullPolicy: IfNotPresent
+  replicas: 2
+  port: 8080
+  logLevel: INFO
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 256Mi }
+  upstream:
+    kind: mock # mock | anthropic
+    url: "" # empty = in-cluster mock-llm Service (kind: mock) or https://api.anthropic.com
+    model: claude-haiku-5-5
+    timeoutSeconds: 10
+  # API key for kind: anthropic. Either let the chart create a Secret from apiKey,
+  # or point at a Secret you created yourself with existingSecret (preferred).
+  secret:
+    existingSecret: ""
+    key: api-key
+    apiKey: ""
+
+mockLlm:
+  enabled: true
+  image:
+    repository: llm-guardrail/mock-llm
+    tag: "0.1.0"
+    pullPolicy: IfNotPresent
+  replicas: 1
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { cpu: 200m, memory: 128Mi }
+  # Fault injection for incident drills.
+  faults:
+    latencyMs: 0
+    errorRate: 0
+
+# Rendered into a ConfigMap and mounted at /etc/guardrail/policy.yaml.
+# Changing anything here rolls the gateway pods (checksum annotation).
+policy:
+  version: "2026-11-27.1"
+  pii:
+    mode: redact # redact | block
+    rules: [email, phone, credit_card, kr_rrn, secret]
+  injection:
+    enabled: true
+    threshold: 3
+  output:
+    redact_pii: true
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 70 # needs metrics-server
+
+ingress:
+  enabled: false
+  className: nginx
+  host: guardrail.localtest.me
+  annotations: {}
+
+networkPolicy:
+  enabled: true
+  # DNS egress for the gateway and client pods. Leave true; the DNS drill sets it false to reproduce an outage.
+  allowDns: true
+  # Namespaces whose pods may call the gateway (matched on kubernetes.io/metadata.name).
+  allowedNamespaces: [ingress-nginx]
+  # Pods in THIS namespace labelled guardrail-client=true may also call the gateway (used by helm test).
+  # Egress to an external LLM API. NetworkPolicy matches IPs, not hostnames, so list CIDRs.
+  externalLLM:
+    enabled: false
+    cidrs: []
+    port: 443
+
+test:
+  enabled: true

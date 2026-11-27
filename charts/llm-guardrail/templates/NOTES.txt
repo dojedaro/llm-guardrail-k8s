@@ -1,0 +1,30 @@
+llm-guardrail {{ .Chart.AppVersion }} installed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+Policy version: {{ .Values.policy.version }}   Upstream: {{ .Values.gateway.upstream.kind }} ({{ include "llm-guardrail.upstreamUrl" . }})
+
+Next steps
+  1. Wait for the pods:
+       kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "llm-guardrail.gatewayName" . }}
+       kubectl -n {{ .Release.Namespace }} get pods
+  2. Run the smoke tests packaged with the chart:
+       helm test {{ .Release.Name }} -n {{ .Release.Namespace }} --logs
+  3. Try it from your workstation:
+       kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "llm-guardrail.gatewayName" . }} 8080:80
+       curl -s localhost:8080/v1/chat -H 'content-type: application/json' \
+         -d '{"messages":[{"role":"user","content":"my email is jane@example.com"}]}'
+{{- if .Values.ingress.enabled }}
+  4. Via ingress: http://{{ .Values.ingress.host }}/v1/chat
+{{- end }}
+  In-cluster address for your applications:
+       http://{{ include "llm-guardrail.gatewayName" . }}.{{ .Release.Namespace }}.svc.cluster.local
+{{- if .Values.networkPolicy.enabled }}
+
+NetworkPolicy is ON (default deny). Callers must be in one of these namespaces:
+  {{ join ", " .Values.networkPolicy.allowedNamespaces }}
+or be pods in "{{ .Release.Namespace }}" labelled guardrail-client=true.
+NOTE: policies only take effect if the cluster CNI enforces them; prove it with drills/06-networkpolicy-enforcement.sh.
+{{- end }}
+{{- if and (eq .Values.gateway.upstream.kind "anthropic") (not .Values.gateway.secret.existingSecret) }}
+
+WARNING: the API key was supplied through Helm values and is stored in the release history.
+Prefer gateway.secret.existingSecret in production.
+{{- end }}

@@ -1,0 +1,87 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "llm-guardrail.gatewayName" . }}
+  labels:
+    {{- include "llm-guardrail.labels" . | nindent 4 }}
+    {{- include "llm-guardrail.gatewaySelector" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.gateway.replicas }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "llm-guardrail.gatewaySelector" . | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        {{- include "llm-guardrail.labels" . | nindent 8 }}
+        {{- include "llm-guardrail.gatewaySelector" . | nindent 8 }}
+      annotations:
+        # A policy change alters this hash, which changes the pod template, which rolls the pods.
+        checksum/policy: {{ include (print $.Template.BasePath "/configmap-policy.yaml") . | sha256sum }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: gateway
+          image: {{ include "llm-guardrail.image" (list . .Values.gateway.image) | quote }}
+          imagePullPolicy: {{ .Values.gateway.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.gateway.port }}
+          env:
+            - name: UPSTREAM_KIND
+              value: {{ .Values.gateway.upstream.kind | quote }}
+            - name: UPSTREAM_URL
+              value: {{ include "llm-guardrail.upstreamUrl" . | quote }}
+            - name: UPSTREAM_MODEL
+              value: {{ .Values.gateway.upstream.model | quote }}
+            - name: UPSTREAM_TIMEOUT_S
+              value: {{ .Values.gateway.upstream.timeoutSeconds | quote }}
+            - name: LOG_LEVEL
+              value: {{ .Values.gateway.logLevel | quote }}
+            - name: POLICY_PATH
+              value: /etc/guardrail/policy.yaml
+            {{- if eq .Values.gateway.upstream.kind "anthropic" }}
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "llm-guardrail.secretName" . }}
+                  key: {{ .Values.gateway.secret.key }}
+            {{- end }}
+          startupProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          resources:
+            {{- toYaml .Values.gateway.resources | nindent 12 }}
+          securityContext:
+            {{- include "llm-guardrail.containerSecurityContext" . | nindent 12 }}
+          volumeMounts:
+            - { name: policy, mountPath: /etc/guardrail, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: policy
+          configMap:
+            name: {{ .Release.Name }}-policy
+        - name: tmp
+          emptyDir: {}

@@ -1,0 +1,7 @@
+apiVersion: v2
+name: llm-guardrail
+description: LLM guardrail gateway (PII redaction, prompt-injection heuristics) with an optional in-cluster mock LLM
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.27.0-0"

@@ -1,0 +1,70 @@
+{{- if .Values.mockLlm.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "llm-guardrail.mockName" . }}
+  labels:
+    {{- include "llm-guardrail.labels" . | nindent 4 }}
+    {{- include "llm-guardrail.mockSelector" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.mockLlm.replicas }}
+  selector:
+    matchLabels:
+      {{- include "llm-guardrail.mockSelector" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "llm-guardrail.labels" . | nindent 8 }}
+        {{- include "llm-guardrail.mockSelector" . | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: mock-llm
+          image: {{ include "llm-guardrail.image" (list . .Values.mockLlm.image) | quote }}
+          imagePullPolicy: {{ .Values.mockLlm.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: MOCK_LATENCY_MS
+              value: {{ .Values.mockLlm.faults.latencyMs | quote }}
+            - name: MOCK_ERROR_RATE
+              value: {{ .Values.mockLlm.faults.errorRate | quote }}
+          startupProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.mockLlm.resources | nindent 12 }}
+          securityContext:
+            {{- include "llm-guardrail.containerSecurityContext" . | nindent 12 }}
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "llm-guardrail.mockName" . }}
+  labels:
+    {{- include "llm-guardrail.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "llm-guardrail.mockSelector" . | nindent 4 }}
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+{{- end }}
