@@ -39,7 +39,7 @@ Design decisions and the readiness trade-off: [docs/ARCHITECTURE.md](docs/ARCHIT
 | `charts/llm-guardrail` | Helm chart, values for kind / air-gapped / external LLM, JSON schema that rejects unknown keys |
 | `scripts/` | `preflight.sh` (environment assessment), `cluster-up/down`, `airgap-bundle/install`, `upgrade-rollback-demo.sh`, `rollout-availability.sh`, `collect-diagnostics.sh`, `chart-check.sh`, `scan-images.sh`, `eval_guardrails.py` |
 | `drills/` | Eight drills with real captured output: seven injected faults and one enforcement proof. **Start with 6, 7 and 8**; drills 1, 4 and 5 are basics |
-| `eval/` | 70 labelled prompts and the baseline the CI gate compares against |
+| `eval/` | 115 labelled prompts and the baseline the CI gate compares against |
 | `tests/` | unit (no cluster), integration (against a release), shell (credential redaction) |
 
 ## Run it
@@ -71,7 +71,8 @@ survives in the response, or an injection that is not blocked, is a false negati
 | Current rules, same 50 prompts (the rules were tuned on these) | 0/19 | 0/16 | 2/15 (13%) |
 | `fresh`: 10 prompts written after the rules were frozen | 0/4 | 0/3 | 2/3 |
 | `multiturn`: 10 conversations of 2 to 5 messages (written after the failures were found) | 0/8 (4/8 before the fix) | n/a | 1/2 |
-| All 70 | 0/31 | 0/19 | 5/20 (25%) |
+| `review`: 45 adversarial prompts written by an independent reviewer who had not seen the corpus (before any change to the rules) | 21/25 (84%) | n/a | 15/20 (75%) |
+| All 115 | 21/56 | 0/19 | 20/40 |
 
 **How to read this:** the rules were tuned on the first 50 prompts, so the zeros there only show that known failures are fixed. `fresh` is the only
 untouched set, and 10 prompts is too few for a rate. Every prompt was written by the author. The remaining misses are a fake `[SYSTEM] New
