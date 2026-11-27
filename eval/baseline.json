@@ -1,0 +1,6 @@
+{
+  "tuned":     {"false_positive": 0, "false_negative_pii": 0, "false_negative_injection": 2},
+  "fresh":     {"false_positive": 0, "false_negative_pii": 0, "false_negative_injection": 2},
+  "multiturn": {"false_positive": 0, "false_negative_pii": 0, "false_negative_injection": 1},
+  "all":       {"false_positive": 0, "false_negative_pii": 0, "false_negative_injection": 5}
+}
