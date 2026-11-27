@@ -2,6 +2,8 @@
 
 Run: `drills/06-networkpolicy-enforcement.sh` (read-only apart from two short-lived test pods and the namespace `np-outsider`).
 
+In the captures, a line starting with `$ ` is either a command that was run or, when it is not a typeable command (for example `$ managedFields after restore`), a label for the step; the output under it is what the real commands printed.
+
 ## Why this drill exists
 The Kubernetes API accepts a NetworkPolicy on **any** cluster. Whether packets are really dropped depends on the CNI plugin.
 If it does not enforce policies, the "default deny" in this chart is decoration and a customer's security review would be misled.

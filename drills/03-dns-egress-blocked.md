@@ -1,6 +1,8 @@
 # Drill 3: NetworkPolicy blocks DNS egress
 
 Inject: `drills/03-dns-egress-blocked.sh`   Undo: `drills/03-dns-egress-blocked.sh restore`
+
+In the captures, a line starting with `$ ` is either a command that was run or, when it is not a typeable command (for example `$ managedFields after restore`), a label for the step; the output under it is what the real commands printed.
 Needs a CNI that enforces NetworkPolicy. Run drill 06 first if you are not sure yours does.
 
 ## Symptom

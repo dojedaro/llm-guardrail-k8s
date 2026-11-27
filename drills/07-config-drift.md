@@ -2,7 +2,9 @@
 
 Inject: `drills/07-config-drift.sh`   Undo: `drills/07-config-drift.sh restore`
 
-This is written as the incident report a customer would receive. The system is the lab cluster; the incident was found by accident while
+In the captures, a line starting with `$ ` is either a command that was run or, when it is not a typeable command (for example `$ managedFields after restore`), a label for the step; the output under it is what the real commands printed.
+
+This is written as a customer-style incident report; there was no actual customer. The system is the lab cluster; the incident was found by accident while
 running the integration tests and then reproduced on purpose by the drill. Versions: Helm v4.3.2, kubectl v1.36.1 client, Kubernetes v1.37.0
 (kind v0.33.0), 2026-11-27.
 
@@ -13,7 +15,7 @@ a blocked change window, a `failed` revision in the release history, and (in the
 *next* upgrade fail again even after a "fix".
 
 ## Impact
-- Customer-facing: none observed. The failed upgrade changed no live object, and the gateway pods were not touched. The hand edit itself rolled the single mock-llm pod; no request loop was running during this drill, so there is no measurement of that moment.
+- Customer-facing (hypothetical, lab only): none observed. The failed upgrade changed no live object, and the gateway pods were not touched. The hand edit itself rolled the single mock-llm pod; no request loop was running during this drill, so there is no measurement of that moment.
 - Operational: the upgrade could not be applied; `helm history` showed revision 6 as `failed` (capture below); anyone reading `helm list`
   would see the release as `failed` even though every pod was healthy.
 
@@ -23,9 +25,9 @@ a blocked change window, a `failed` revision in the release history, and (in the
 | 04:36:30 | Operator runs `kubectl set env deploy/guardrail-mock-llm MOCK_LATENCY_MS=1` ("temporary" change). Deployment rolls; `kubectl-set` becomes owner of that env var. |
 | 04:36:38 | Planned change window: `helm upgrade ... --set policy.version=drift-demo --wait`. Helm 4 applies server-side, the API server reports a conflict, Helm records revision 6 as `failed`. |
 | 04:36:39 | `managedFields` inspected: `helm` (Apply) and `kubectl-set` (Update) both appear, the latter owns the env var. |
-| 04:36:51 | Resolution: ownership handed back with `--force-conflicts`, then rolled back to the last deployed revision (5). |
+| 04:36:51 | Resolution: the stale `kubectl-set` field manager removed, ownership re-asserted with `helm upgrade --force-conflicts`, then rolled back to the last deployed revision (5). |
 
-## What the customer-visible error looked like
+## What the customer-visible error would look like
 ```text
 # drill 07, 2026-11-27T04:36:27Z, helm v4.3.2+g8346aaa, kind v0.33.0, k8s v1.37.0
 $ drills/07-config-drift.sh
@@ -103,7 +105,8 @@ Helm 4 applies manifests with **server-side apply** by default. Every field has 
 All three were checked live on the same cluster, with the same versions, on the same day:
 
 1. **`helm upgrade --force-conflicts` works when Helm's value differs from the hand edit.** Helm wants `0`, the live value is `1`: forcing
-   takes the field over, and afterwards only `helm` owns it. This is what `drills/07-config-drift.sh restore` does. Decide first which value is
+   takes the field over, and afterwards only `helm` owns it. `drills/07-config-drift.sh restore` does this, but first removes the stale `kubectl-set` manager entry (the capture
+   above shows it) and only then re-applies with `--force-conflicts`, so it also works when the two values are equal (point 2). Decide first which value is
    right: forcing throws away whatever the other person changed.
 2. **A shared field is not cleaned up by `--force-conflicts`.** If the hand-edited value equals what Helm is told to apply (we set
    `MOCK_LATENCY_MS=1` by hand and ran `helm upgrade --set mockLlm.faults.latencyMs=1`), both managers co-own the field and there is no

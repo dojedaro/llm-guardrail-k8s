@@ -1,6 +1,8 @@
 # Drill 8: planned node maintenance (node drain with PodDisruptionBudgets)
 
 Inject: `drills/08-node-drain.sh`   Undo: `drills/08-node-drain.sh restore`
+
+In the captures, a line starting with `$ ` is either a command that was run or, when it is not a typeable command (for example `$ managedFields after restore`), a label for the step; the output under it is what the real commands printed.
 Needs the release installed with the ingress on (`values-kind.yaml`) for the request loop, and exactly two worker nodes.
 
 ## What it shows

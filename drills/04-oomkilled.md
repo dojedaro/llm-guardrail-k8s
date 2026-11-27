@@ -2,6 +2,8 @@
 
 Inject: `drills/04-oomkilled.sh`   Undo: `drills/04-oomkilled.sh restore`
 
+In the captures, a line starting with `$ ` is either a command that was run or, when it is not a typeable command (for example `$ managedFields after restore`), a label for the step; the output under it is what the real commands printed.
+
 ## Symptom
 New gateway pods restart repeatedly: status goes `Running` -> `OOMKilled` -> `CrashLoopBackOff`, with a growing RESTARTS count.
 The old pods keep serving (`maxUnavailable: 0`), so users may notice nothing; the stuck rollout is the only sign.

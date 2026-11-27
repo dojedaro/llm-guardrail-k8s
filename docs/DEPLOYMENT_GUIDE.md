@@ -48,7 +48,7 @@ server as a server-side dry run into the target namespace, so that namespace's o
 egress to the LLM endpoint.
 
 The NetworkPolicy probe fetches a file from a server pod **before** a deny-all policy exists (positive control: if that fails, the result is
-"inconclusive", never a pass) and then requires the fetch to **time out** after it. The last two checks run from the workstation: repeat them
+"inconclusive", never a pass) and then requires the fetch to **time out or be refused** after it (Calico drops packets; k3s rejects the connection). The last two checks run from the workstation: repeat them
 from a pod inside the cluster if the cluster sits behind a different proxy or firewall.
 
 Resolve every FAIL before installing. A WARN needs a conscious decision recorded in the ticket.
@@ -75,7 +75,7 @@ helm upgrade --install guardrail charts/llm-guardrail -n guardrail \
 Notes: NetworkPolicy matches IP ranges, not hostnames, so provider IP changes require updating the list; consider an egress proxy or a CNI
 with FQDN policies if the provider's addresses change often. The model id is `gateway.upstream.model` (default `claude-haiku-5-5`). Current Claude models think by default and thinking tokens count against
 `max_tokens`, so the gateway sends `gateway.upstream.maxTokens` (4096) and a low `gateway.upstream.effort`; raise `maxTokens` if answers come back
-empty (the log says `stop_reason=max_tokens`). A model refusal is returned as `502 upstream_refused`.
+empty (the log says `stop_reason=max_tokens`). Upstream failures are reported by kind (`gateway_upstream_errors_total{kind=...}` and the `upstream_<kind>` error code): `timeout` 504; `unavailable`, `auth` (provider 401/403: check the API key), `bad_request` (provider 400) and `refused` (model refusal) 502; `overloaded` (provider 529) 503; `rate_limited` (provider 429) is passed through as `429` with `Retry-After` (the provider's value, else 5 s, at most 120 s). A request needs at least one `user` message and no fields other than `messages`/`role`/`content`, otherwise it is a 422.
 Prefer `existingSecret` to `gateway.secret.apiKey`: a key passed to Helm is stored in the release history. **The Anthropic adapter has only been
 tested against a mocked transport, not the real API.**
 

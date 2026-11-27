@@ -1,6 +1,8 @@
 # Drill 5: missing or wrong Secret (CreateContainerConfigError)
 
 Inject: `drills/05-missing-secret.sh [missing|wrongkey]`   Undo: `drills/05-missing-secret.sh restore`
+
+In the captures, a line starting with `$ ` is either a command that was run or, when it is not a typeable command (for example `$ managedFields after restore`), a label for the step; the output under it is what the real commands printed.
 No real API key is needed: the pods never start. (The drill also enables the external-LLM egress rule with a documentation-range
 address, because the chart refuses `kind: anthropic` without one; nothing is ever contacted.)
 

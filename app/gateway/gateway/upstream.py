@@ -56,7 +56,7 @@ async def _post(client: httpx.AsyncClient, url: str, **kw: Any) -> httpx.Respons
             resp = await client.post(url, **kw)
         except httpx.ConnectError:
             # Nothing was sent, so one retry is safe. It rides out a pod that is being replaced
-            # (stale endpoint) during a rolling update, which is the zero-downtime case.
+            # (stale endpoint) during a rolling update, which keeps a rolling update free of failed requests.
             resp = await client.post(url, **kw)
     except httpx.TimeoutException as exc:
         raise UpstreamTimeout(str(exc) or "timeout") from exc

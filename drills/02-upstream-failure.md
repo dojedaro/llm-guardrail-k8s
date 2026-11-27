@@ -2,6 +2,8 @@
 
 Inject: `drills/02-upstream-failure.sh [url|502|504]`   Undo: `drills/02-upstream-failure.sh restore`
 
+In the captures, a line starting with `$ ` is either a command that was run or, when it is not a typeable command (for example `$ managedFields after restore`), a label for the step; the output under it is what the real commands printed.
+
 | Mode | What is broken | What the client sees |
 |---|---|---|
 | `url` | upstream URL in the config points at a Service that does not exist | new pods stay `0/1 Ready` (readiness fails); old pods keep serving |
