@@ -21,11 +21,22 @@ spec:
       annotations:
         # A policy change alters this hash, which changes the pod template, which rolls the pods.
         checksum/policy: {{ include (print $.Template.BasePath "/configmap-policy.yaml") . | sha256sum }}
+        {{- with .Values.gateway.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
     spec:
       automountServiceAccountToken: false
       # Must exceed preStop + the longest in-flight request (upstream timeout) or pods are SIGKILLed mid-request.
       terminationGracePeriodSeconds: {{ .Values.gateway.terminationGracePeriodSeconds }}
       {{- include "llm-guardrail.pullSecrets" . | nindent 6 }}
+      {{- with .Values.gateway.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.gateway.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       # Spread replicas over nodes so one node drain or failure cannot take out every replica.
       topologySpreadConstraints:
         - maxSkew: 1
@@ -54,6 +65,10 @@ spec:
               value: {{ .Values.gateway.upstream.model | quote }}
             - name: UPSTREAM_TIMEOUT_S
               value: {{ .Values.gateway.upstream.timeoutSeconds | quote }}
+            - name: UPSTREAM_MAX_TOKENS
+              value: {{ .Values.gateway.upstream.maxTokens | quote }}
+            - name: UPSTREAM_EFFORT
+              value: {{ .Values.gateway.upstream.effort | quote }}
             - name: LOG_LEVEL
               value: {{ .Values.gateway.logLevel | quote }}
             - name: POLICY_PATH

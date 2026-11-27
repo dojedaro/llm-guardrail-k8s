@@ -29,11 +29,19 @@ gateway:
   resources:
     requests: { cpu: 100m, memory: 128Mi }
     limits: { cpu: 500m, memory: 256Mi }
+  # Scheduling: pin to labelled nodes, tolerate taints, annotate pods (e.g. for a service mesh or Prometheus).
+  nodeSelector: {}
+  tolerations: []
+  podAnnotations: {}
   upstream:
     kind: mock # mock | anthropic
     url: "" # empty = in-cluster mock-llm Service (kind: mock) or https://api.anthropic.com
     model: claude-haiku-5-5
     timeoutSeconds: 10
+    # anthropic only. Thinking tokens count against maxTokens, so keep it well above the longest answer you need;
+    # a low effort keeps short chat answers from being spent on reasoning. Empty effort sends none.
+    maxTokens: 4096
+    effort: low
   # API key for kind: anthropic. Either let the chart create a Secret from apiKey,
   # or point at a Secret you created yourself with existingSecret (preferred).
   secret:
@@ -51,6 +59,9 @@ mockLlm:
   resources:
     requests: { cpu: 50m, memory: 64Mi }
     limits: { cpu: 200m, memory: 128Mi }
+  nodeSelector: {}
+  tolerations: []
+  podAnnotations: {}
   # Fault injection for incident drills.
   faults:
     latencyMs: 0
@@ -86,11 +97,11 @@ ingress:
 
 networkPolicy:
   enabled: true
+  # Pods in THIS namespace labelled guardrail-client=true may also call the gateway (the helm test pod, drills).
   # DNS egress for the gateway and client pods. Leave true; the DNS drill sets it false to reproduce an outage.
   allowDns: true
   # Namespaces whose pods may call the gateway (matched on kubernetes.io/metadata.name).
   allowedNamespaces: [ingress-nginx]
-  # Pods in THIS namespace labelled guardrail-client=true may also call the gateway (used by helm test).
   # Source CIDRs that may call the gateway. Needed when the ingress controller runs with hostNetwork
   # (its traffic arrives from the node IP, which a namespaceSelector cannot match).
   allowedIngressCidrs: []

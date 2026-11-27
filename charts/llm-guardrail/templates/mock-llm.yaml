@@ -14,9 +14,21 @@ spec:
     metadata:
       labels:
         {{- include "llm-guardrail.mockLabels" . | nindent 8 }}
+      {{- with .Values.mockLlm.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
     spec:
       automountServiceAccountToken: false
       {{- include "llm-guardrail.pullSecrets" . | nindent 6 }}
+      {{- with .Values.mockLlm.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.mockLlm.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       topologySpreadConstraints:
         - maxSkew: 1
           topologyKey: kubernetes.io/hostname
