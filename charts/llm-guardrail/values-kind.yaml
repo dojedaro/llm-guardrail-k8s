@@ -1,0 +1,4 @@
+# For the local kind cluster created by scripts/cluster-up.sh: also expose the gateway through ingress-nginx.
+# kind maps host port 8080 to the controller, so: curl -H 'Host: guardrail.localtest.me' http://localhost:8080/v1/chat
+ingress:
+  enabled: true

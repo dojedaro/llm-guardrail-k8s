@@ -36,6 +36,11 @@ spec:
         - podSelector:
             matchLabels:
               guardrail-client: "true"
+        {{- /* Ingress controllers on hostNetwork arrive from the node IP, which no namespace selector matches. */}}
+        {{- range .Values.networkPolicy.allowedIngressCidrs }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
       ports:
         - protocol: TCP
           port: {{ .Values.gateway.port }}
@@ -54,16 +59,7 @@ spec:
   policyTypes: [Egress]
   egress:
     {{- if .Values.networkPolicy.allowDns }}
-    - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: kube-system
-          podSelector:
-            matchLabels:
-              k8s-app: kube-dns
-      ports:
-        - { protocol: UDP, port: 53 }
-        - { protocol: TCP, port: 53 }
+    {{- include "llm-guardrail.dnsEgress" . | nindent 4 }}
     {{- end }}
     {{- if .Values.mockLlm.enabled }}
     - to:
@@ -119,16 +115,7 @@ spec:
   policyTypes: [Egress]
   egress:
     {{- if .Values.networkPolicy.allowDns }}
-    - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: kube-system
-          podSelector:
-            matchLabels:
-              k8s-app: kube-dns
-      ports:
-        - { protocol: UDP, port: 53 }
-        - { protocol: TCP, port: 53 }
+    {{- include "llm-guardrail.dnsEgress" . | nindent 4 }}
     {{- end }}
     - to:
         - podSelector:

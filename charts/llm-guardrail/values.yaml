@@ -3,6 +3,8 @@
 global:
   # Prefix for every image, e.g. "registry.customer.local:5000". Leave empty for Docker Hub / local images.
   imageRegistry: ""
+  # Names of existing docker-registry Secrets for a private registry that needs credentials.
+  imagePullSecrets: []
 
 gateway:
   image:
@@ -10,8 +12,20 @@ gateway:
     tag: "0.1.0"
     pullPolicy: IfNotPresent
   replicas: 2
-  port: 8080
+  port: 8080 # the container listens here (passed to the image as PORT)
   logLevel: INFO
+  # Rolling updates: preStop sleep lets endpoint removal propagate before the process gets SIGTERM.
+  preStopSleepSeconds: 5
+  terminationGracePeriodSeconds: 30
+  # Extra environment variables, e.g. an egress proxy for the external LLM:
+  #   - { name: HTTPS_PROXY, value: "http://proxy.corp.example:3128" }
+  #   - { name: NO_PROXY, value: ".svc,.cluster.local,10.0.0.0/8" }
+  extraEnv: []
+  # Private CA bundle (PEM) from an existing ConfigMap, for TLS-inspecting proxies or private LLM endpoints.
+  # Sets SSL_CERT_FILE, which REPLACES the default trust store: include public roots if the gateway also needs them.
+  caBundle:
+    configMapName: ""
+    key: ca.crt
   resources:
     requests: { cpu: 100m, memory: 128Mi }
     limits: { cpu: 500m, memory: 256Mi }
@@ -55,21 +69,20 @@ policy:
   output:
     redact_pii: true
 
+# Rendered only when gateway.replicas > 1 (with one replica it would block every node drain).
 podDisruptionBudget:
   enabled: true
   minAvailable: 1
 
-autoscaling:
-  enabled: false
-  minReplicas: 2
-  maxReplicas: 5
-  targetCPUUtilizationPercentage: 70 # needs metrics-server
-
+# Exposes /v1 only (never /metrics or /readyz). kind maps host port 8080 to the ingress controller.
 ingress:
   enabled: false
   className: nginx
   host: guardrail.localtest.me
   annotations: {}
+  tls:
+    enabled: false
+    secretName: "" # an existing kubernetes.io/tls Secret
 
 networkPolicy:
   enabled: true
@@ -78,6 +91,15 @@ networkPolicy:
   # Namespaces whose pods may call the gateway (matched on kubernetes.io/metadata.name).
   allowedNamespaces: [ingress-nginx]
   # Pods in THIS namespace labelled guardrail-client=true may also call the gateway (used by helm test).
+  # Source CIDRs that may call the gateway. Needed when the ingress controller runs with hostNetwork
+  # (its traffic arrives from the node IP, which a namespaceSelector cannot match).
+  allowedIngressCidrs: []
+  # Where cluster DNS lives. Change for node-local-dns (add its link-local IP, e.g. 169.254.20.10/32, to extraCidrs)
+  # or a DNS service outside kube-system.
+  dns:
+    namespaceLabels: { kubernetes.io/metadata.name: kube-system }
+    podLabels: { k8s-app: kube-dns }
+    extraCidrs: []
   # Egress to an external LLM API. NetworkPolicy matches IPs, not hostnames, so list CIDRs.
   externalLLM:
     enabled: false

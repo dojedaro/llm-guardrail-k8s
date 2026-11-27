@@ -3,12 +3,9 @@ kind: Deployment
 metadata:
   name: {{ include "llm-guardrail.gatewayName" . }}
   labels:
-    {{- include "llm-guardrail.labels" . | nindent 4 }}
-    {{- include "llm-guardrail.gatewaySelector" . | nindent 4 }}
+    {{- include "llm-guardrail.gatewayLabels" . | nindent 4 }}
 spec:
-  {{- if not .Values.autoscaling.enabled }}
   replicas: {{ .Values.gateway.replicas }}
-  {{- end }}
   selector:
     matchLabels:
       {{- include "llm-guardrail.gatewaySelector" . | nindent 6 }}
@@ -20,13 +17,23 @@ spec:
   template:
     metadata:
       labels:
-        {{- include "llm-guardrail.labels" . | nindent 8 }}
-        {{- include "llm-guardrail.gatewaySelector" . | nindent 8 }}
+        {{- include "llm-guardrail.gatewayLabels" . | nindent 8 }}
       annotations:
         # A policy change alters this hash, which changes the pod template, which rolls the pods.
         checksum/policy: {{ include (print $.Template.BasePath "/configmap-policy.yaml") . | sha256sum }}
     spec:
       automountServiceAccountToken: false
+      # Must exceed preStop + the longest in-flight request (upstream timeout) or pods are SIGKILLed mid-request.
+      terminationGracePeriodSeconds: {{ .Values.gateway.terminationGracePeriodSeconds }}
+      {{- include "llm-guardrail.pullSecrets" . | nindent 6 }}
+      # Spread replicas over nodes so one node drain or failure cannot take out every replica.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "llm-guardrail.gatewaySelector" . | nindent 14 }}
       securityContext:
         runAsNonRoot: true
         seccompProfile:
@@ -51,6 +58,15 @@ spec:
               value: {{ .Values.gateway.logLevel | quote }}
             - name: POLICY_PATH
               value: /etc/guardrail/policy.yaml
+            - name: PORT
+              value: {{ .Values.gateway.port | quote }}
+            {{- if .Values.gateway.caBundle.configMapName }}
+            - name: SSL_CERT_FILE
+              value: /etc/guardrail-ca/{{ .Values.gateway.caBundle.key }}
+            {{- end }}
+            {{- with .Values.gateway.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
             {{- if eq .Values.gateway.upstream.kind "anthropic" }}
             - name: ANTHROPIC_API_KEY
               valueFrom:
@@ -58,6 +74,13 @@ spec:
                   name: {{ include "llm-guardrail.secretName" . }}
                   key: {{ .Values.gateway.secret.key }}
             {{- end }}
+          lifecycle:
+            # Keep serving for a few seconds after SIGTERM: Service endpoint removal propagates to
+            # kube-proxy and the ingress controller asynchronously, so without this a rolling update
+            # can send requests to a pod that is already shutting down.
+            preStop:
+              exec:
+                command: ["sleep", {{ .Values.gateway.preStopSleepSeconds | quote }}]
           startupProbe:
             httpGet: { path: /healthz, port: http }
             periodSeconds: 2
@@ -79,9 +102,17 @@ spec:
           volumeMounts:
             - { name: policy, mountPath: /etc/guardrail, readOnly: true }
             - { name: tmp, mountPath: /tmp }
+            {{- if .Values.gateway.caBundle.configMapName }}
+            - { name: ca, mountPath: /etc/guardrail-ca, readOnly: true }
+            {{- end }}
       volumes:
         - name: policy
           configMap:
             name: {{ .Release.Name }}-policy
         - name: tmp
           emptyDir: {}
+        {{- if .Values.gateway.caBundle.configMapName }}
+        - name: ca
+          configMap:
+            name: {{ .Values.gateway.caBundle.configMapName }}
+        {{- end }}

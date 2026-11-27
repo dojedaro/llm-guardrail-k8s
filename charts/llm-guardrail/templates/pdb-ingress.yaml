@@ -1,38 +1,16 @@
-{{- if .Values.podDisruptionBudget.enabled }}
+{{- /* A PDB with minAvailable 1 and a single replica would block every node drain forever, so only render it for 2+ replicas. */}}
+{{- if and .Values.podDisruptionBudget.enabled (gt (int .Values.gateway.replicas) 1) }}
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
   name: {{ include "llm-guardrail.gatewayName" . }}
   labels:
-    {{- include "llm-guardrail.labels" . | nindent 4 }}
+    {{- include "llm-guardrail.gatewayLabels" . | nindent 4 }}
 spec:
   minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
   selector:
     matchLabels:
       {{- include "llm-guardrail.gatewaySelector" . | nindent 6 }}
-{{- end }}
-{{- if .Values.autoscaling.enabled }}
----
-apiVersion: autoscaling/v2
-kind: HorizontalPodAutoscaler
-metadata:
-  name: {{ include "llm-guardrail.gatewayName" . }}
-  labels:
-    {{- include "llm-guardrail.labels" . | nindent 4 }}
-spec:
-  scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: {{ include "llm-guardrail.gatewayName" . }}
-  minReplicas: {{ .Values.autoscaling.minReplicas }}
-  maxReplicas: {{ .Values.autoscaling.maxReplicas }}
-  metrics:
-    - type: Resource
-      resource:
-        name: cpu
-        target:
-          type: Utilization
-          averageUtilization: {{ .Values.autoscaling.targetCPUUtilizationPercentage }}
 {{- end }}
 {{- if .Values.ingress.enabled }}
 ---
@@ -41,18 +19,24 @@ kind: Ingress
 metadata:
   name: {{ include "llm-guardrail.gatewayName" . }}
   labels:
-    {{- include "llm-guardrail.labels" . | nindent 4 }}
+    {{- include "llm-guardrail.gatewayLabels" . | nindent 4 }}
   {{- with .Values.ingress.annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
   ingressClassName: {{ .Values.ingress.className }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts: [{{ .Values.ingress.host | quote }}]
+      secretName: {{ required "ingress.tls.secretName is required when ingress.tls.enabled" .Values.ingress.tls.secretName }}
+  {{- end }}
   rules:
     - host: {{ .Values.ingress.host | quote }}
       http:
         paths:
-          - path: /
+          # Only the API is exposed. /metrics, /readyz and /healthz stay cluster-internal.
+          - path: /v1
             pathType: Prefix
             backend:
               service:
