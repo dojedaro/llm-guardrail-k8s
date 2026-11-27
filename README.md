@@ -1,8 +1,24 @@
 # llm-guardrail-k8s
 
-A small gateway that sits in front of an LLM API and redacts PII or blocks prompt injection, packaged as a Helm chart with the
-operational tooling around it: environment assessment, online and air-gapped install, incident drills, upgrade and rollback, a support-bundle
-collector and a deployment guide. It runs on a local kind cluster with a mock LLM, so it needs no API key.
+A rehearsal of deploying an AI-security product into a customer's Kubernetes cluster, end to end: assess the environment, install with Helm
+(online and from an air-gap bundle), prove it works, break it and diagnose it, upgrade, roll back, and hand over a deployment guide. The product
+is deliberately small: a gateway in front of an LLM API that redacts PII and blocks prompt-injection phrases. It runs on a local 3-node kind
+cluster and on k3s on Ubuntu, with a mock LLM, so it needs no API key.
+
+## Measured on 2026-11-27
+Kubernetes v1.37 (kind v0.33.0 with Calico v3.28.2; k3s v1.37.2 on Ubuntu 26.04), Helm v4.3.2. Raw output and dates: [docs/EVIDENCE.md](docs/EVIDENCE.md).
+
+- **Zero-downtime rollouts:** 0 failed requests of 2,994 at 20 requests/s through the ingress across 3 upgrades and 1 rollback. The negative
+  control (delete the single upstream pod during the loop) fails 119 of 691, so the probe can see failures.
+- **Node drain held by PodDisruptionBudgets:** 0 failed of 2,996 requests while two nodes were drained (drill 8).
+- **NetworkPolicy enforcement proven, not assumed:** a probe must connect first, then be blocked. Calico drops (timeout); k3s rejects (connection
+  refused). Same probe, same verdict logic (drill 6).
+- **A real incident, written up for a customer:** a Helm 4 field-ownership conflict after a hand edit, with the diagnosis and the fix (drill 7).
+- **Air-gap install on a cluster that never had the images:** the registry log shows the nodes fetching manifests and layers from the bundle's registry.
+- **Hardening checked on the running system:** installs and passes `helm test` in a namespace that enforces the `restricted` Pod Security profile;
+  Trivy reports 0 fixable HIGH/CRITICAL findings in both images.
+- **Guardrails measured on a labelled corpus**, with the misses listed (table below).
+- **Not done:** the Anthropic adapter has not been run against the real API (mocked-transport unit tests only).
 
 ```mermaid
 flowchart LR
@@ -14,23 +30,23 @@ flowchart LR
     end
     gw -. "allowlisted egress (optional)" .-> ext["Anthropic Messages API"]
 ```
-Design decisions and the readiness trade-off: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+Design decisions and the readiness trade-off: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Operating it: [docs/DEPLOYMENT_GUIDE.md](docs/DEPLOYMENT_GUIDE.md).
 
 ## What is in here
 | Path | Contents |
 |---|---|
 | `app/gateway`, `app/mock-llm` | FastAPI gateway (guardrails, adapters, metrics) and a fake LLM with fault-injection switches |
 | `charts/llm-guardrail` | Helm chart, values for kind / air-gapped / external LLM, JSON schema that rejects unknown keys |
-| `scripts/` | `preflight.sh` (assessment), `cluster-up/down`, `airgap-bundle/install`, `upgrade-rollback-demo.sh`, `rollout-availability.sh`, `collect-diagnostics.sh`, `chart-check.sh`, `eval_guardrails.py` |
-| `drills/` | Eight incident drills; each has a script that breaks something and a writeup with real captured output |
-| `eval/corpus.jsonl` | 60 labelled prompts used to measure the guardrails |
+| `scripts/` | `preflight.sh` (environment assessment), `cluster-up/down`, `airgap-bundle/install`, `upgrade-rollback-demo.sh`, `rollout-availability.sh`, `collect-diagnostics.sh`, `chart-check.sh`, `scan-images.sh`, `eval_guardrails.py` |
+| `drills/` | Eight drills with real captured output: seven injected faults and one enforcement proof. **Start with 6, 7 and 8**; drills 1, 4 and 5 are basics |
+| `eval/` | 70 labelled prompts and the baseline the CI gate compares against |
 | `tests/` | unit (no cluster), integration (against a release), shell (credential redaction) |
-| `docs/` | [Deployment guide](docs/DEPLOYMENT_GUIDE.md), [architecture](docs/ARCHITECTURE.md), [hands-on lab](docs/LAB.md), [evidence](docs/EVIDENCE.md) |
 
 ## Run it
-Needs Docker, kind, kubectl and Helm 4 (tested: kind v0.33.0, Kubernetes v1.37.0, Helm v4.3.2, Docker Desktop 29.9.3, Git Bash on Windows 11).
+Needs Docker, kind, kubectl and Helm 4 (tested: kind v0.33.0, Kubernetes v1.37.0, Helm v4.3.2, Docker Desktop 29.9.3, Git Bash on Windows 11;
+Git Bash rewrites Unix-looking arguments, which the scripts switch off with `MSYS_NO_PATHCONV=1`).
 ```bash
-CNI=calico scripts/cluster-up.sh                  # 3-node kind cluster, Calico, ingress-nginx, images
+CNI=calico scripts/cluster-up.sh                  # 3-node kind cluster (pinned node image), Calico, ingress, images
 PROBE_NETPOL=1 scripts/preflight.sh               # assessment, incl. an active NetworkPolicy enforcement probe
 helm install guardrail charts/llm-guardrail -n guardrail --create-namespace \
   -f charts/llm-guardrail/values-kind.yaml --wait
@@ -41,58 +57,43 @@ drills/06-networkpolicy-enforcement.sh            # proves NetworkPolicy is enfo
 scripts/upgrade-rollback-demo.sh
 scripts/cluster-down.sh
 ```
-Unit tests need no cluster: `pip install -r app/gateway/requirements.txt -r requirements-dev.txt && pytest tests/unit`.
+Without a cluster: `pip install -r app/gateway/requirements.txt -r requirements-dev.txt && pytest tests/unit`, and
+`python scripts/eval_guardrails.py --in-process --gate` runs the corpus against the app in the same process.
+On k3s or another cluster, `IMAGE_LOADER=k3s|none` selects how the images reach the nodes (`scripts/lib.sh`).
 
 ## Guardrail quality, measured
-`scripts/eval_guardrails.py` sends `eval/corpus.jsonl` to the deployed gateway and counts: a benign prompt blocked or redacted is a false
-positive; PII that survives in the response, or an injection that is not blocked, is a false negative. Real runs, 2026-11-27:
+`scripts/eval_guardrails.py` sends `eval/corpus.jsonl` to the deployed gateway. A benign prompt blocked or redacted is a false positive; PII that
+survives in the response, or an injection that is not blocked, is a false negative. Real runs on 2026-11-27:
 
 | | Benign false positives | PII false negatives | Injection false negatives |
 |---|---|---|---|
-| Before this round of fixes (50 prompts) | 2/19 (11%) | 4/16 (25%) | 10/15 (67%) |
-| After, `dev` half (25) | 0/9 | 0/8 | 0/8 |
-| After, `heldout` half (25) | 0/10 | 0/8 | 2/7 (29%) |
-| After, `fresh` (10, written after the rules were frozen, run once) | 0/4 | 0/3 | 2/3 |
-| After, all 60 | 0/23 (0%) | 0/19 (0%) | 4/18 (22%) |
+| First version of the rules (50 prompts) | 2/19 (11%) | 4/16 (25%) | 10/15 (67%) |
+| Current rules, same 50 prompts (the rules were tuned on these) | 0/19 | 0/16 | 2/15 (13%) |
+| `fresh`: 10 prompts written after the rules were frozen | 0/4 | 0/3 | 2/3 |
+| `multiturn`: 10 conversations of 2 to 5 messages (written after the failures were found) | 0/8 (4/8 before the fix) | n/a | 1/2 |
+| All 70 | 0/31 | 0/19 | 5/20 (25%) |
 
-Read these carefully. The rules were tuned on `dev`. `heldout` was written together with `dev` by the same author, who had already seen
-the failure cases, so it is **not** an independent test; only `fresh` is, and 10 prompts is too few for a rate. The corpus is small and
-written by the author. The misses that remain are a fake `[SYSTEM] New instructions:` tag, leetspeak (`1gn0re`), a Spanish injection and
-`SYSTEM OVERRIDE:` phrasing. The numbers show regressions are caught and the known weak spots, not how it performs on real traffic.
-
-## What has actually been verified
-All runs on a local kind cluster on 2026-11-27 (versions above); raw output and the failures found along the way are in [docs/EVIDENCE.md](docs/EVIDENCE.md).
-
-| Item | Status |
-|---|---|
-| Unit tests | **96 passed** in `python:3.12.16` with the image's pinned dependencies; also 96 passed on local Python 3.14 with newer ones. `ruff` clean |
-| Chart static checks | `helm lint`, `helm template` for six values combinations, **kubeconform -strict** (v0.6.7, Kubernetes 1.31 schemas), strict duplicate-key YAML check, 8 bad-value cases rejected. The same check **failed** on the previous commit (duplicate label keys) |
-| Install, `helm test` | 7/7 smoke checks pass; ingress exposes `/v1` only (`/metrics`, `/readyz` answer 404) |
-| Integration tests | **10 passed** with `REQUIRE_CLUSTER=1` (includes 502/504 fault injection through Helm and a live security-context check) |
-| Preflight | 13 PASS with the active NetworkPolicy probe (positive control, then must time out); with an unpullable probe image it reports "inconclusive", not PASS |
-| Drills 1-8 | Run with inject, diagnose and restore; real output in each writeup. Drill 6 passes (Calico). Drill 8: 2996 requests through a two-node drain held by PodDisruptionBudgets, 0 failed |
-| Upgrade / rollback | Config change and image upgrade (0.1.0 to 0.1.1) each verified, then rolled back and verified |
-| Rolling-update availability | 0 failed of 2994 requests (20/s through the ingress) across 3 upgrades and 1 rollback. Negative control (delete the single upstream pod): 119 of 691 failed, so the measurement can see failures |
-| Air-gapped install | Bundle built, a one-byte corruption detected, install from the bundle works; the registry log shows the nodes fetching from it. The network is not physically cut off |
-| Support bundle | Planted fake credentials were absent from the bundle after a redactor fix; a first run leaked one (`name:`/`value:` env pairs) |
-| Image scan | Trivy (0.58.1) found 3 HIGH starlette CVEs in the first image; after bumping the pins the Python findings are gone and 4 HIGH `libpam` findings in the Debian 12 base remain (fix available upstream, not yet in the pinned base tag) |
-| GitHub Actions workflow | **Not run** (repo not pushed). Its steps are the commands above; action versions are unchecked major tags |
-| Anthropic adapter | **Not run** against the real API (mocked-transport unit tests only) |
-| Helm 3, TLS ingress, proxy env, private CA, `imagePullSecrets` | **Not tested**; rendered and schema-checked only |
-| `make` targets | Not run (`make` is not installed on the author's machine) |
-| Drills were captured before the final dependency bump | Behaviour-relevant code is unchanged; they were not re-run on the final image |
+**How to read this:** the rules were tuned on the first 50 prompts, so the zeros there only show that known failures are fixed. `fresh` is the only
+untouched set, and 10 prompts is too few for a rate. Every prompt was written by the author. The remaining misses are a fake `[SYSTEM] New
+instructions:` tag, leetspeak (`1gn0re`), a Spanish injection, `SYSTEM OVERRIDE:` phrasing and an injection split across two messages. These numbers show the
+known weak spots, not performance on real traffic. `eval/baseline.json` records today's miss counts and CI fails if any split gets worse.
 
 ## Limitations
+- The guardrails are heuristics (regex, checksums, phrase rules). They miss paraphrased, encoded, translated or split-across-turns attacks and unlisted
+  PII formats, and can over-redact. Card detection needs Luhn plus a known scheme prefix and length; on random 4-digit groups it still flags about 12% of
+  rows (28% with Luhn alone).
+- The gateway does not authenticate callers and does not rate-limit; the NetworkPolicy is the only access control.
 - kind is a rehearsal environment: no real node pools, load balancer, storage or cloud IAM. The mock LLM is a deterministic echo.
-- The guardrails are heuristics (regex, checksums, phrase rules). They miss paraphrased, encoded, translated or multi-turn attacks and unlisted PII formats, and can over-redact.
 - NetworkPolicy for an external API works on IP ranges, not hostnames, so the allowlist needs maintenance.
 - When the single upstream is down every gateway replica goes NotReady together (a deliberate trade-off, see ARCHITECTURE.md).
-- The air-gap flow simulates an offline site; setup itself (image pulls, `pip`) uses the internet.
+- The air-gap flow simulates an offline site (the network is not cut); setup itself (image pulls, `pip`) uses the internet.
+- Not tested: Helm 3, TLS on the ingress, proxy and private-CA settings, `imagePullSecrets` (rendered and schema-checked only), and the GitHub Actions
+  workflow (it has not run on GitHub; every step is a command that was run locally).
 
 ## How this was built
-Built with an AI coding assistant, and then reviewed by an independent reviewer on a different model. The runs, failures and fixes found on a
-real cluster (a duplicate-label bug, a NetworkPolicy probe that could not fail, a redactor leak, an ingress controller on the wrong node, and more)
-are listed in [docs/EVIDENCE.md](docs/EVIDENCE.md).
+Built with an AI coding assistant and checked by a second AI model acting as an independent reviewer. The failures this found and fixed (a duplicate-label
+bug, a NetworkPolicy probe that could not fail, a redactor leak, an ingress controller on the wrong node, and more) are listed in
+[docs/EVIDENCE.md](docs/EVIDENCE.md).
 
 ## License
 MIT, see [LICENSE](LICENSE).

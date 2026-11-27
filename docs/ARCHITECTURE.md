@@ -13,7 +13,7 @@ flowchart LR
     end
     gw -. "egress allowlist (CIDR :443)<br/>only if external LLM enabled" .-> ext["External LLM API"]
     gw -->|"DNS :53"| dns["cluster DNS"]
-    gw -->|"/metrics"| prom["Prometheus (optional)"]
+    prom["Prometheus (optional,<br/>its namespace must be allowed)"] -->|"scrape /metrics"| gw
 ```
 
 ## Request path
@@ -21,15 +21,17 @@ flowchart LR
    `A-Za-z0-9._-`, otherwise a fresh one is generated) or generated.
 2. **Input guardrails** run on every message of every role (the Anthropic adapter hoists system text into the system prompt, so a caller-supplied
    system or assistant message is as dangerous as a user message): PII detection (email, phone including Korean formats, Luhn-validated card
-   numbers, Korean resident registration numbers, API-key/JWT/private-key-shaped secrets) and prompt-injection heuristics, English and Korean.
-   The work runs in a thread pool, so a slow regex cannot stall liveness probes, and the total request size is capped (100,000 characters).
+   numbers, Korean resident registration numbers, API-key/JWT/private-key-shaped secrets) and prompt-injection heuristics, English and Korean. A request is blocked when any one message reaches the injection threshold,
+   with each rule counted once per message: scores are never added up across turns, so a long benign conversation about "developer mode" is not blocked
+   (and an attack split over several turns is not caught).
+   The work runs in a thread pool, so a slow regex cannot stall liveness probes, and the request size is capped (50 messages, 20,000 characters each, 100,000 in total, a 1 MiB body).
    The policy decides between *redact* (replace with placeholders, continue) and *block* (HTTP 403, upstream never called).
 3. The allowed request goes to the upstream through an adapter: the in-cluster mock LLM, or the Anthropic Messages API.
    A connection error is retried once (nothing was sent, so it is safe); timeouts are not retried.
 4. **Output guardrail** redacts PII in the reply.
 5. The response carries `X-Request-ID` and `X-Policy-Version`; one JSON log line records the decision, rule ids, latency and status (never message content).
    Every stdout line is JSON, including validation errors (422) and unexpected errors (500).
-6. Upstream failures map to explicit codes: timeout -> 504, refused / error status -> 502, both with the request id. The response body
+6. Upstream failures map to explicit codes: timeout -> 504, connection refused / error status / model refusal -> 502, all with the request id. The response body
    names only the class of failure; the raw exception text stays in the log.
 7. A blocked response includes the rule ids that matched. That is deliberate (operators and application teams need it to debug false positives);
    it does let a caller probe which phrases trip the rules, so deployments that treat the callers as untrusted should strip `rules` at the edge.

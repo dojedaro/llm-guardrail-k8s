@@ -1,110 +1,122 @@
 # Evidence
 
-Every output below was produced on 2026-11-27 on one workstation by the commands named in each section; nothing is edited except
-where a line is marked cut. Full logs are not committed (`reports/` is gitignored); the drill writeups contain their own full captures.
+Everything below was produced on 2026-11-27 on one workstation by the commands named in each section, except the k3s section (a second host, same day). Nothing is edited
+except where a line is marked cut. Full logs are not committed (`reports/` is gitignored); the drill writeups contain their own full captures. Each section says which
+build it ran against, because several things were fixed while this was being written.
 
 ## Environment
 | Component | Version |
 |---|---|
 | Host | Windows 11 Home 10.0.26200, Git Bash, Docker Desktop 29.9.3 (12 CPUs, 8 GB for the VM) |
-| kind | v0.33.0, node image `kindest/node` (Kubernetes v1.37.0, containerd 2.3.4), 1 control plane + 2 workers |
-| CNI / ingress | Calico v3.28.2, ingress-nginx (kind's documented manifest) |
+| kind | v0.33.0, node image `kindest/node:v1.37.0@sha256:a1ed56cf...` (Kubernetes v1.37.0, containerd 2.3.4), 1 control plane + 2 workers |
+| CNI / ingress | Calico v3.28.2; ingress-nginx controller-v1.15.1, the last release before the project was retired (March 2026) |
 | Helm / kubectl | Helm v4.3.2, kubectl client v1.36.1 |
-| Gateway image | `python:3.12.16-slim-bookworm`, fastapi 0.165.0, starlette 1.10.0, pydantic 2.14.4 |
-| Local Python | 3.14.2 with newer dependencies than the image (unit tests were also run in the 3.12.16 image environment) |
-| kubeconform / Trivy / shellcheck | v0.6.7 / 0.58.1 / koalaman/shellcheck:stable, all run from container images |
+| Gateway image | `python:3.12.16-slim-bookworm` plus the libpam security update, fastapi 0.165.0, starlette 1.10.0, pydantic 2.14.4 |
+| Local Python | 3.14.2 with newer dependencies than the image; the unit tests were also run in a `python:3.12.16-slim-bookworm` container with the pinned ones |
+| Tools run from container images | kubeconform v0.6.7, Trivy 0.58.1, shellcheck (all pinned by digest in the scripts and the workflow), mypy 2.4.1 and ruff 0.17.6 (pinned in `requirements-dev.txt`) |
 
-CI: the GitHub Actions workflow has **not** been run (repo not pushed). Its steps are the commands in this file.
+CI: the GitHub Actions workflow has **not** run on GitHub (the repository has not been pushed). Its steps are the commands in this file.
 
 ## Failures found by running it, and what was done
 | Found | How | Fix |
 |---|---|---|
-| Duplicate `app.kubernetes.io/instance` label keys in the Deployments | `kubeconform -strict` and the duplicate-key check failed on the previous commit | label helpers split; check is part of `scripts/chart-check.sh` |
-| NetworkPolicy preflight probe could not fail (404 and non-zero exit read as "blocked") | review, then positive control added; bad probe image now yields "inconclusive" | rewritten probe |
-| `test_upstream_failure_codes[504]` failed | the coordinator suspected mock latency delaying `/healthz`; it was not: the test's port-forward was bound to a gateway pod that the upgrade replaced | tests open a fresh port-forward |
-| ingress-nginx controller landed on a worker, so `localhost:8080` was dead | ingress test; the manifest no longer pins the node | `cluster-up.sh` patches the nodeSelector |
-| Drill wait loops matched stale events from earlier runs and returned at once | drill 2 run | wait on the pod's own events |
-| Support bundle leaked `value: hunter2-planted` (env var name and value on separate lines) | planted-credential test | redactor rule and test added; rerun shows nothing leaked |
-| `crictl rmi` on the registry-named image removed the local image sharing its ID and left an unpullable stub | the next default install went to `ImagePullBackOff` | step removed; the registry's access log is the evidence instead |
+| Benign multi-turn conversations were blocked: 4 of 8 (an Android "developer mode" chat, "You are now ready" in two turns, a colleague called Dan) | the new `multiturn` corpus split, run against the previous rules | injection score is per message, each rule once; the persona name `DAN` is case-sensitive |
+| The card detector could be bypassed with a long run of digit groups in front of the card; Luhn alone flagged 28% of random digit groups | review of the regexes, then measured | no cap on the run; scheme prefix and length check on top of Luhn (about 12% now, README says so) |
+| `detect_pii` overlap check was quadratic (3.5 s CPU on a request of short emails); a 30 MiB body was read before it was rejected | review, then measured | sort and bisect; 1 MiB body limit with 413 |
+| The support-bundle redactor let a parent key swallow the next line (`secret:` then `apiKey: ...` left the key in), and did not mask `scheme://user:password@host` | review, then added to `tests/scripts/test-redact.sh` | separator may not span a newline; URL credential rule |
+| Two scripts and one test file were committed without the executable bit (CI would have failed before any test ran) | review; first seen as `Permission denied` on Ubuntu | modes fixed; CI now checks every `*.sh` is 100755 |
+| The image scan failed (4 HIGH `libpam` findings, fix available), and the workflow ran the scanner as a tag-pinned third-party action (a tag can be moved) | Trivy | packages upgraded in both Dockerfiles; Trivy runs from a container image pinned by digest; the other actions are pinned to commits |
+| The preflight Pod Security check could not fail (it always printed PASS) | review | now a server-side dry run of the chart in the target namespace; the first real run found a conflict with a leftover hook pod (`--force-conflicts` added) and a regex that matched "violate" but the API says "violates" |
+| Drills' one-shot pods were not admitted in a namespace enforcing the `restricted` profile | install into such a namespace | restricted security context on every `run_pod`; the first version of the override replaced the container (no image), fixed by passing the whole container |
+| Drill 6 failed on a re-run: `np-outsider` was still terminating from the previous run | restricted-namespace run | the drill deletes the old namespace first and waits |
+| An image the kubelet pulled from the air-gap registry could not be reused after `kind load` under its normal name: `ImagePullBackOff`, "pull access denied", with the image listed on the node | reusing the cold air-gap cluster for the normal install | `/var/lib/kubelet/image_manager/pulled` holds the kubelet's own pull records; deleting them and restarting the kubelet fixed it. Documented in the troubleshooting table; one delivery path per cluster |
+| Duplicate `app.kubernetes.io/instance` label keys in the Deployments | `kubeconform -strict` and the duplicate-key check failed on an earlier commit | label helpers split; the check is part of `scripts/chart-check.sh` |
+| NetworkPolicy preflight probe could not fail (404 and non-zero exit read as "blocked") | review, then positive control added | rewritten probe; a bad probe image now yields "inconclusive" |
+| ingress-nginx controller landed on a worker, so `localhost:8080` was dead | ingress test | `cluster-up.sh` patches the nodeSelector and waits for the rollout |
+| Drill wait loops matched stale events from earlier runs and returned at once | drill 2 | wait on the pod's own events |
+| Support bundle leaked `value: hunter2-planted` (env var name and value on separate lines) | planted-credential test | redactor rule and test added |
+| `crictl rmi` on the registry-named image removed the local image sharing its ID | the next default install went to `ImagePullBackOff` | step removed; the registry's access log is the evidence instead |
 | Availability probe measured about 0.5 requests/s | `localhost` resolves IPv6 first on Windows (~2 s) | probe uses 127.0.0.1 and four loops |
-| Trivy: 3 HIGH starlette CVEs | image scan | dependencies and base image bumped |
-| `containerd config dump` shows an empty registry `config_path`, yet `certs.d` is honoured | air-gap install | check is a warning, proven by the registry log |
+| `test_upstream_failure_codes[504]` failed | the test's port-forward was bound to a gateway pod that the upgrade replaced | tests open a fresh port-forward |
+| k3s: scripts not executable, no `python` on Ubuntu, a REJECT read as inconclusive | the k3s run (below) | fixed in `978f8db` |
 
-## Static checks (`scripts/chart-check.sh`)
+## Static checks (`scripts/chart-check.sh`, 2026-11-27, current chart)
 ```text
 --- default
 ok: 12 documents, no duplicate keys
-Summary: 12 resources found parsing stdin - Valid: 12, Invalid: 0, Errors: 0, Skipped: 0
+Summary: 12 resources - Valid: 12, Invalid: 0, Errors: 0, Skipped: 0
 --- airgapped
 ok: 12 documents, no duplicate keys
-Summary: 12 resources found parsing stdin - Valid: 12, Invalid: 0, Errors: 0, Skipped: 0
+Summary: 12 resources - Valid: 12, Invalid: 0, Errors: 0, Skipped: 0
 --- external-llm
 ok: 9 documents, no duplicate keys
-Summary: 9 resources found parsing stdin - Valid: 9, Invalid: 0, Errors: 0, Skipped: 0
+Summary: 9 resources - Valid: 9, Invalid: 0, Errors: 0, Skipped: 0
 --- ingress+tls+extras
 ok: 13 documents, no duplicate keys
-Summary: 13 resources found parsing stdin - Valid: 13, Invalid: 0, Errors: 0, Skipped: 0
+Summary: 13 resources - Valid: 13, Invalid: 0, Errors: 0, Skipped: 0
+--- k3s-traefik
+ok: 13 documents, no duplicate keys
+Summary: 13 resources - Valid: 13, Invalid: 0, Errors: 0, Skipped: 0
+--- scheduling
+ok: 12 documents, no duplicate keys
+Summary: 12 resources - Valid: 12, Invalid: 0, Errors: 0, Skipped: 0
 --- kind-ingress
 ok: 13 documents, no duplicate keys
-Summary: 13 resources found parsing stdin - Valid: 13, Invalid: 0, Errors: 0, Skipped: 0
+Summary: 13 resources - Valid: 13, Invalid: 0, Errors: 0, Skipped: 0
 --- single-replica
 ok: 11 documents, no duplicate keys
-Summary: 11 resources found parsing stdin - Valid: 11, Invalid: 0, Errors: 0, Skipped: 0
+Summary: 11 resources - Valid: 11, Invalid: 0, Errors: 0, Skipped: 0
 --- PDB is not rendered for a single replica
---- bad values must be rejected
-rejected: image tag latest
-rejected: pii.mode=maybe
-rejected: typo gateway.replica
-rejected: typo netwrokPolicy
-rejected: external values without cidrs
-rejected: anthropic without egress allow
-rejected: mock kind with mockLlm disabled
-rejected: tls enabled without secret
+ok
+--- scheduling values reach both Deployments
+ok
+--- bad values must be rejected, for the stated reason
+rejected: image tag latest  [/gateway/image/tag]
+rejected: pii.mode=maybe  [value must be one of 'redact', 'block']
+rejected: injection threshold 0  [/policy/injection/threshold]
+rejected: unknown effort  [/gateway/upstream/effort]
+rejected: typo gateway.replica  [additional properties 'replica' not allowed]
+rejected: typo netwrokPolicy  [additional properties 'netwrokPolicy' not allowed]
+rejected: external values without cidrs  [externalLLM.cidrs]
+rejected: anthropic without egress allow  [default-deny blocks every upstream call]
+rejected: mock kind with mockLlm disabled  [has no upstream]
+rejected: tls enabled without secret  [ingress.tls.secretName is required]
 chart-check: all checks passed
 ```
+The `k3s-traefik` case renders the values used on k3s (an Ingress with class `traefik`, Traefik's namespace allowed); it is a render and schema check, not traffic.
 
-The previous commit's chart, same checks:
+## Unit tests, linters, type check, redaction test
 ```text
-# chart at commit 349e5dc (before round 2), 2026-11-27T02:01:08Z
-FAIL: duplicate key 'app.kubernetes.io/instance'
-  in "<stdin>", line 247, column 5
-stdin - Deployment t-gateway failed validation: error unmarshalling resource: error converting YAML to JSON: yaml: unmarshal errors:
-  line 12: key "app.kubernetes.io/instance" already set in map
-  line 32: key "app.kubernetes.io/instance" already set in map
-```
-
-## Unit tests, linters, redaction test
-```text
+# python:3.12.16-slim-bookworm container, pinned requirements
 Python 3.12.16
-fastapi==0.165.0
-httpx==0.29.0
-prometheus_client==0.26.0
-pydantic==2.14.4
-pydantic_core==2.50.5
-pytest==9.2.0
-pytest-asyncio==1.5.0
-PyYAML==6.0.4
-ruff==0.17.6
-starlette==1.10.0
-uvicorn==0.54.0
-96 passed, 1 warning in 5.05s
+fastapi==0.165.0   httpx==0.29.0   mypy==2.4.1   pydantic==2.14.4   pytest==9.2.0
+PyYAML==6.0.4      ruff==0.17.6    starlette==1.10.0   uvicorn==0.54.0
 All checks passed!
-32 files already formatted
+33 files already formatted
+Success: no issues found in 7 source files            <- mypy --strict
+146 passed, 1 warning in 27.98s
+gate: passed (no split has more misses than eval/baseline.json)
 ```
 ```text
-# 2026-11-27T02:40:18Z local venv: Python 3.14.2 with NEWER deps than the image (fastapi 0.165.0, starlette 1.10.0, pytest 9.2.0)
-96 passed, 1 warning in 27.74s
-All checks passed!
+# local venv, Python 3.14.2 with newer dependencies than the image
+146 passed, 1 warning in 22.52s
+```
+```text
+$ tests/scripts/test-redact.sh      (excerpt; 28 cases: values that must disappear and ordinary config that must stay)
+ok   hidden: HTTPS_PROXY=http://svc-user:hunter2@proxy.corp...
+ok   hidden: postgres://app:hunter2@db.internal:5432/guardrai...
+ok   hidden: secret:
+ok   kept:   HTTPS_PROXY=http://proxy.corp.example:3128
+ok   kept:   secretName: guardrail-llm-key
 redact tests passed
 ```
-Shell: `shellcheck -x` over `scripts/`, `drills/`, `tests/scripts/` exits 0 (`.shellcheckrc` lists four deliberate exceptions).
+`shellcheck -x` over `scripts/`, `drills/` and `tests/scripts/` exits 0 with no global exceptions (the three places that need a directive carry it inline, with the reason).
 
-## Install and helm test
+## Install and helm test (kind, current build)
 ```text
-# 2026-11-27T03:19:23Z
+# 2026-11-27T04:33:28Z, release installed with values-kind.yaml
+STATUS: deployed
 Phase:          Succeeded
-
-POD LOGS: guardrail-smoke-test (smoke)
 PASS readyz is 200
 PASS policy version matches release
 PASS chat returns 200
@@ -112,10 +124,26 @@ PASS email redacted before upstream
 PASS X-Request-ID header present
 PASS output guardrail redacts upstream leak
 PASS prompt injection blocked with 403
-
 ```
 
-## Preflight with the NetworkPolicy probe
+## Install into a namespace that enforces the `restricted` Pod Security profile
+```text
+# 2026-11-27T04:29:26Z
+{"kubernetes.io/metadata.name":"psa-restricted","pod-security.kubernetes.io/enforce":"restricted","pod-security.kubernetes.io/warn":"restricted"}
+STATUS: deployed
+Phase:          Succeeded      (helm test, 7/7 PASS)
+# drill 6 in the same namespace (its one-shot pods now carry a restricted security context)
+control  -> ok   (expected: ok)
+outsider -> blocked (dropped: timeout)  (expected: blocked)
+PASS: NetworkPolicy is enforced by this cluster: traffic dropped: timeout while the control got through
+events mentioning PodSecurity: 0
+```
+The preflight check is a server-side dry run of the chart into the namespace. Negative control for the message it looks for, a privileged pod sent the same way:
+```text
+Error from server (Forbidden): pods "root-pod" is forbidden: violates PodSecurity "restricted:latest": privileged (container "c" must not set securityContext.privileged=true), ...
+```
+
+## Preflight with the NetworkPolicy probe (current build)
 ```text
 PASS  kubernetes version           server v1.37.0 (need >= 1.27); Client Version: v1.36.1
 PASS  rbac in namespace guardrail  can create the objects the chart needs (incl. pods, PDBs, Helm release secrets)
@@ -125,61 +153,98 @@ PASS  capacity                     free to schedule 34050m CPU / 22746Mi memory 
 PASS  default storageclass         standard
 PASS  ingress controller           IngressClass: nginx
 PASS  cluster dns                  2/2 kube-dns pods ready (label k8s-app=kube-dns)
-PASS  pod security (ns guardrail)  enforce=none; chart complies with the restricted profile
+PASS  pod security (ns guardrail)  enforce=none: server-side dry run of the chart was admitted with no PodSecurity warnings
 PASS  networkpolicy support        CNI known to enforce NetworkPolicy: calico (PROBE_NETPOL=1 proves it)
-PASS  networkpolicy enforcement    active probe: fetch worked before deny-all (control) and TIMED OUT after it
+PASS  networkpolicy enforcement    active probe: fetch worked before deny-all (control) and TIMED OUT after it (dropped)
 PASS  registry reachable           https://registry-1.docker.io/v2/ -> HTTP 401 (401 is normal for registries)
 PASS  egress to upstream llm       https://api.anthropic.com -> HTTP 404
-Summary: 13 PASS, 0 WARN, 0 FAIL   (report: reports/preflight-20261127-115050.txt)
+Summary: 13 PASS, 0 WARN, 0 FAIL
 ```
-Negative case, earlier probe implementation with an unpullable probe image: `WARN networkpolicy enforcement  probe inconclusive: server pod did not become Ready` (12 PASS, 1 WARN, 0 FAIL), not a PASS.
+Negative case, earlier probe implementation with an unpullable probe image: `WARN networkpolicy enforcement  probe inconclusive: server pod did not become Ready`, not a PASS.
 
-## Integration tests
+## Integration tests (current build, `REQUIRE_CLUSTER=1`)
 ```text
-tests/integration/test_gateway_cluster.py::test_ready_and_policy_version PASSED [ 10%]
-tests/integration/test_gateway_cluster.py::test_pii_redacted_end_to_end PASSED [ 20%]
-tests/integration/test_gateway_cluster.py::test_output_guardrail_redacts_upstream_leak PASSED [ 30%]
-tests/integration/test_gateway_cluster.py::test_prompt_injection_blocked PASSED [ 40%]
-tests/integration/test_gateway_cluster.py::test_request_id_appears_in_pod_logs_without_pii PASSED [ 50%]
-tests/integration/test_gateway_cluster.py::test_metrics_increment PASSED [ 60%]
-tests/integration/test_gateway_cluster.py::test_upstream_failure_codes[fault0-502] PASSED [ 70%]
-tests/integration/test_gateway_cluster.py::test_upstream_failure_codes[fault1-504] PASSED [ 80%]
-tests/integration/test_gateway_cluster.py::test_security_context_is_enforced_on_the_running_pod PASSED [ 90%]
-tests/integration/test_gateway_cluster.py::test_ingress_exposes_only_the_api PASSED [100%]
-======================== 10 passed in 64.84s (0:01:04) ========================
+test_ready_and_policy_version PASSED                    test_metrics_increment PASSED
+test_pii_redacted_end_to_end PASSED                     test_upstream_failure_codes[fault0-502] PASSED
+test_output_guardrail_redacts_upstream_leak PASSED      test_upstream_failure_codes[fault1-504] PASSED
+test_prompt_injection_blocked PASSED                    test_security_context_is_enforced_on_the_running_pod PASSED
+test_benign_multi_turn_conversation_is_not_blocked PASSED   test_ingress_exposes_only_the_api PASSED
+test_oversized_body_is_refused_with_413 PASSED          test_request_id_appears_in_pod_logs_without_pii PASSED
+======================== 12 passed in 86.37s (0:01:26) ========================
 ```
+
+## Guardrail evaluation
+The first version of the rules, 50 prompts (deployed 0.1.0 image of an earlier commit):
+```text
+[all] 50 prompts
+  false positives (benign blocked or redacted): 2/19 = 11%
+  false negatives, PII not redacted:            4/16 = 25%
+  false negatives, injection not blocked:       10/15 = 67%
+```
+The previous commit's rules against the 70-prompt corpus (in-process; this is what the new `multiturn` split caught):
+```text
+MISS m01  multiturn  benign    developer-mode     HTTP 403 blocked {'inj_jailbreak_keywords': 2}
+MISS m02  multiturn  benign    role-phrase        HTTP 403 blocked {'inj_role_override': 2}
+MISS m03  multiturn  benign    persona-name       HTTP 403 blocked {'inj_jailbreak_keywords': 2, 'inj_role_override': 1}
+MISS m06  multiturn  benign    mixed-weak-rules   HTTP 403 blocked {'inj_jailbreak_keywords': 1, 'inj_role_override': 1}
+[multiturn] 10 prompts
+  false positives (benign blocked or redacted): 4/8 = 50%
+```
+The current rules against the deployed gateway (`python scripts/eval_guardrails.py --gate`, 2026-11-27T04:35:33Z, image `llm-guardrail/gateway:0.1.0`):
+```text
+MISS i13  tuned      injection fake-tag           HTTP 200 allow rules={'inj_fake_system_tag': 1}
+MISS i17  tuned      injection obfuscated         HTTP 200 allow rules={}
+MISS f08  fresh      injection fake-tag           HTTP 200 allow rules={}
+MISS f10  fresh      injection other-language     HTTP 200 allow rules={}
+MISS m10  multiturn  injection split-across-turns HTTP 200 allow rules={}
+
+[tuned] 50 prompts
+  false positives (benign blocked or redacted): 0/19 = 0%
+  false negatives, PII not redacted:            0/16 = 0%
+  false negatives, injection not blocked:       2/15 = 13%
+[fresh] 10 prompts
+  false positives (benign blocked or redacted): 0/4 = 0%
+  false negatives, PII not redacted:            0/3 = 0%
+  false negatives, injection not blocked:       2/3 = 67%
+[multiturn] 10 prompts
+  false positives (benign blocked or redacted): 0/8 = 0%
+  false negatives, PII not redacted:            n/a
+  false negatives, injection not blocked:       1/2 = 50%
+[all] 70 prompts
+  false positives (benign blocked or redacted): 0/31 = 0%
+  false negatives, PII not redacted:            0/19 = 0%
+  false negatives, injection not blocked:       5/20 = 25%
+gate: passed (no split has more misses than eval/baseline.json)
+```
+`tuned` is the old `dev` and `heldout` halves together: the rules were tuned on all 50. `multiturn` was written after its failures were seen, so it is a regression set, not a test. The in-process run
+(`--in-process --gate`, used by the unit-test job) gives the same counts.
 
 ## Drills
 Full captures (inject, describe, events, logs, restore) are in each writeup: [01](../drills/01-bad-image-tag.md), [02](../drills/02-upstream-failure.md),
 [03](../drills/03-dns-egress-blocked.md), [04](../drills/04-oomkilled.md), [05](../drills/05-missing-secret.md),
 [06](../drills/06-networkpolicy-enforcement.md), [07](../drills/07-config-drift.md) (incident report), [08](../drills/08-node-drain.md).
-They were captured on the image built before the final dependency bump; the behaviour they exercise is unchanged.
+- **Drills 6 and 7 were re-run on the current build** (2026-11-27T04:36Z) and their captures replaced. Drill 7's restore now also removes the stale `kubectl-set` field manager, and the capture ends with `managedFields` showing only `helm` and `kube-controller-manager`.
+- Drills 1 and 4 were re-run (inject and restore) as a regression check of the shared helpers; both restored to a healthy release. Their writeups keep the earlier captures.
+- Drills 2, 3, 5 and 8 keep captures taken earlier the same day on the previous build; the behaviour they exercise did not change.
 
-## Upgrade and rollback (`scripts/upgrade-rollback-demo.sh`)
+## Upgrade and rollback (`scripts/upgrade-rollback-demo.sh`, current build)
 ```text
-==> baseline: revision 5, pii.mode=redact, gateway image tag 0.1.0
-    readyz: {"version":"0.1.0","policy_loaded":true,"upstream_reachable":true,"policy_version":"2026-11-27.1"}
-    chat with an email address -> HTTP 200 (expected 200 for pii.mode=redact)
-==> A. config change: pii.mode=block
-    readyz: {"version":"0.1.0","policy_loaded":true,"upstream_reachable":true,"policy_version":"upgrade-demo-114746"}
-    chat with an email address -> HTTP 403 (expected 403 for pii.mode=block)
-==> A. rollback to revision 5
-    readyz: {"version":"0.1.0","policy_loaded":true,"upstream_reachable":true,"policy_version":"2026-11-27.1"}
-    chat with an email address -> HTTP 200 (expected 200 for pii.mode=redact)
-==> B. image upgrade: build gateway 0.1.1 and load it into kind
+==> A. config change: pii.mode=block        -> chat with an email address -> HTTP 403 (expected 403 for pii.mode=block)
+==> A. rollback to revision 8               -> chat with an email address -> HTTP 200 (expected 200 for pii.mode=redact)
+==> B. image upgrade: build gateway 0.1.1 and load it into the cluster
     readyz: {"version":"0.1.1","policy_loaded":true,"upstream_reachable":true,"policy_version":"2026-11-27.1"}
-    chat with an email address -> HTTP 200 (expected 200 for pii.mode=redact)
-guardrail-gateway-5ff9b8cdd8-kq64l  llm-guardrail/gateway:0.1.1
-guardrail-gateway-5ff9b8cdd8-qpml4  llm-guardrail/gateway:0.1.1
-guardrail-gateway-86f69d77d7-r9wkp  llm-guardrail/gateway:0.1.0
-==> B. rollback to revision 7
+guardrail-gateway-646c646f9f-pl9vk  llm-guardrail/gateway:0.1.0
+guardrail-gateway-bb54fb78b-dkwtv  llm-guardrail/gateway:0.1.1
+guardrail-gateway-bb54fb78b-hbjrw  llm-guardrail/gateway:0.1.1
+==> B. rollback to revision 10
     readyz: {"version":"0.1.0","policy_loaded":true,"upstream_reachable":true,"policy_version":"2026-11-27.1"}
-    chat with an email address -> HTTP 200 (expected 200 for pii.mode=redact)
 ==> OK: config change and image upgrade both verified, and both rolled back
 exit code: 0
 ```
+(The release history in that run also contains the integration tests' and drills' revisions, so the numbers are not 1, 2, 3.)
 
 ## Availability during rollouts (`scripts/rollout-availability.sh`)
+Measured earlier the same day on the previous commit's build; the chart's rollout settings (`maxUnavailable: 0`, `maxSurge: 1`, preStop sleep) have not changed since, and this was not re-measured.
 ```text
 ==> request loop: 20/s for 150s through the ingress
 ==> rollout 1: policy.version change
@@ -193,143 +258,144 @@ failed requests: 0 of 2994
 Negative control (delete the single upstream pod while the loop runs):
 ```text
 requests sent: 691 in 45s (target 20/s, 4 concurrent loops)
-  HTTP 200: 572
-  HTTP 502: 47
-  HTTP 503: 64
-  transport error: TimeoutError: 8
+  HTTP 200: 572   HTTP 502: 47   HTTP 503: 64   transport error: TimeoutError: 8
 failed requests: 119 of 691
 first failure at t+8.1s (HTTP 502), last at t+26.6s (HTTP 503)
 ```
+Drill 8 (two-node drain held by the PodDisruptionBudgets, request loop running): 0 failed of 2,996 requests, same day, previous build.
 
-## Air-gapped install
+## Air-gapped install, on a cluster that never had the images
+The cluster was created with `IMAGE_LOADER=none CNI=calico scripts/cluster-up.sh` (so the images were built but **not** loaded) and the three nodes were checked:
 ```text
-==> bundle ready: dist/llm-guardrail-airgap-0.1.0.tar.gz (65M)
-  llm-guardrail/gateway:0.1.0  sha256:0ea3fad2c101ed3ffc5020df49d253abda9eea4316befea8d936f0773bc59b20
-  llm-guardrail/mock-llm:0.1.0  sha256:52ce29dd78f365585638aaed53b9e9f5e09d34de12f616e9099a13ed5a1c5950
-  registry:2.8.3  sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
--rw-r--r-- 1 user group 67787188 Nov 27 11:55 llm-guardrail-airgap-0.1.0.tar.gz
--rw-r--r-- 1 user group      100 Nov 27 11:55 llm-guardrail-airgap-0.1.0.tar.gz.sha256
-897720f00e104c6ac9a57946a697c35d83c7276a60d5109e85a85e8c25f5299e *llm-guardrail-airgap-0.1.0.tar.gz
+guardrail-control-plane: 0     guardrail-worker: 0     guardrail-worker2: 0      (crictl images | grep -c 'llm-guardrail\|registry:2')
 ```
+Bundle, outer and inner checksums, then the install from the bundle (`scripts/airgap-bundle.sh`, `scripts/airgap-install.sh`, 2026-11-27T04:14Z):
 ```text
-# negative test: one byte of the bundle overwritten after the checksum was made, 2026-11-27T02:55:48Z
+==> bundle ready: dist/llm-guardrail-airgap-0.1.0.tar.gz (67M)
+  llm-guardrail/gateway:0.1.0  sha256:2f4e3364c1240930fd978c6a902c2a5c243accbaff2dacb0d3195bc1a697424d
+  llm-guardrail/mock-llm:0.1.0  sha256:10f163ff930149409afef061b90e87765052b3d9543ff190f4b5fb6154775e76
+  registry:2.8.3  sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
 ==> verifying the bundle file against its .sha256 (outer checksum)
+llm-guardrail-airgap-0.1.0.tar.gz: OK
+==> verifying the checksums inside the bundle
+images.tar: OK   ./llm-guardrail-0.1.0.tgz: OK   values-airgapped.yaml: OK   airgap-install.sh: OK   lib.sh: OK   MANIFEST.txt: OK
+registry catalog:
+{"repositories":["llm-guardrail/gateway","llm-guardrail/mock-llm"]}
+==> evidence 1: images the pods run (all must start with kind-registry:5000/)
+guardrail-gateway-664f6b578f-frms6  kind-registry:5000/llm-guardrail/gateway:0.1.0
+guardrail-gateway-664f6b578f-n745m  kind-registry:5000/llm-guardrail/gateway:0.1.0
+guardrail-mock-llm-678984d54d-l25kx  kind-registry:5000/llm-guardrail/mock-llm:0.1.0
+==> evidence 2: the registry's own access log shows the nodes fetching the images from it
+requests from the nodes (containerd): manifests 9, blobs 29
+172.18.0.2 - - [27/Nov/2026:04:14:56 +0000] "GET /v2/llm-guardrail/mock-llm/blobs/sha256:539c7d06...695c7 HTTP/1.1" 200 93 "" "containerd/v2.3.4"
+172.18.0.2 - - [27/Nov/2026:04:14:56 +0000] "GET /v2/llm-guardrail/mock-llm/blobs/sha256:21ccbdc4...45f23 HTTP/1.1" 200 193 "" "containerd/v2.3.4"
+172.18.0.2 - - [27/Nov/2026:04:14:56 +0000] "GET /v2/llm-guardrail/mock-llm/blobs/sha256:79929c14...a66d HTTP/1.1" 200 1008 "" "containerd/v2.3.4"
+172.18.0.2 - - [27/Nov/2026:04:14:56 +0000] "GET /v2/llm-guardrail/mock-llm/blobs/sha256:c9921ac4...4df6 HTTP/1.1" 200 5587165 "" "containerd/v2.3.4"
+Phase:          Succeeded       (helm test 7/7 PASS)
+```
+The 5.6 MB blob is an image layer; 29 blob requests in total came from the nodes' containerd, which is what a first pull looks like. (The filter drops the pushes from the Docker client.)
+The network was not cut: the machine still has internet, so this shows the bundle and the registry were used, not that nothing else was reachable.
+```text
+# negative test: one byte of the bundle overwritten after the checksum was made (earlier the same day)
 llm-guardrail-airgap-0.1.0.tar.gz: FAILED
 sha256sum: WARNING: 1 computed checksum did NOT match
 exit code: 1
 ```
-```text
-==> verifying the bundle file against its .sha256 (outer checksum)
-llm-guardrail-airgap-0.1.0.tar.gz: OK
-==> verifying the checksums inside the bundle
-images.tar: OK
-./llm-guardrail-0.1.0.tgz: OK
-values-airgapped.yaml: OK
-airgap-install.sh: OK
-lib.sh: OK
-MANIFEST.txt: OK
-==> loading images into the local Docker daemon
-==> starting private registry 'kind-registry'
-==> teaching each kind node's containerd to use the registry over plain HTTP
-==> pushing images to the registry
-registry catalog:
-{"repositories":["llm-guardrail/gateway","llm-guardrail/mock-llm"]}
-==> installing the chart FROM THE BUNDLE with registry kind-registry:5000
-==> evidence 1: images the pods run (all must start with kind-registry:5000/)
-guardrail-gateway-7c9b9d9c-f7b64  kind-registry:5000/llm-guardrail/gateway:0.1.0
-guardrail-gateway-7c9b9d9c-zv5vw  kind-registry:5000/llm-guardrail/gateway:0.1.0
-guardrail-mock-llm-678984d54d-tpd84  kind-registry:5000/llm-guardrail/mock-llm:0.1.0
-==> evidence 2: the registry's own access log shows the nodes fetching the images from it
-172.18.0.2 - - [27/Nov/2026:03:16:20 +0000] "GET /v2/llm-guardrail/gateway/manifests/sha256:0ea3fad2c101ed3ffc5020df49d253abda9eea4316befea8d936f0773bc59b20 HTTP/1.1" 200 856 "" "containerd/v2.3.4"
-172.18.0.4 - - [27/Nov/2026:03:16:20 +0000] "GET /v2/llm-guardrail/mock-llm/manifests/sha256:52ce29dd78f365585638aaed53b9e9f5e09d34de12f616e9099a13ed5a1c5950 HTTP/1.1" 200 856 "" "containerd/v2.3.4"
-172.18.0.4 - - [27/Nov/2026:03:16:20 +0000] "GET /v2/llm-guardrail/gateway/manifests/sha256:0ea3fad2c101ed3ffc5020df49d253abda9eea4316befea8d936f0773bc59b20 HTTP/1.1" 200 856 "" "containerd/v2.3.4"
-PASS readyz is 200
-PASS policy version matches release
-PASS chat returns 200
-PASS email redacted before upstream
-PASS X-Request-ID header present
-PASS output guardrail redacts upstream leak
-PASS prompt injection blocked with 403
-exit code: 0
-```
 
-## Support bundle redaction test
+## Support bundle redaction test (current build)
 ```text
-# collect-diagnostics redaction test on the live release, 2026-11-27T03:15:14Z
-$ plant fake credentials: two env vars in the Deployment, a ConfigMap value, and a key inside a request body
-upgraded
+# 2026-11-27T04:39:06Z
+$ plant fake credentials: three env vars in the Deployment (one is a password inside a proxy URL), and a key inside a request body
 $ scripts/collect-diagnostics.sh
-==> collecting from namespace 'guardrail' into diagnostics-20261127-121531
-==> support bundle: diagnostics-20261127-121531.tar.gz
 Redaction is a safety net, not a guarantee: read the bundle before it leaves your organisation.
-bundle: diagnostics-20261127-121531.tar.gz (16K), files: 28
 $ grep for the planted values in the bundle (expect nothing)
 none found
+$ matches inside the tarball itself (expect 0): 0
 $ env var NAMES are kept, values are not:
-            - name: PLANTED_API_KEY
-              value: <redacted>
-            - name: PLANTED_PASSWORD
-              value: <redacted>
-$ matches inside the tarball itself (expect 0)
-0
+  - name: PLANTED_API_KEY
+    value: <redacted>
+  - name: PLANTED_PASSWORD
+    value: <redacted>
+  - name: HTTPS_PROXY
+    value: http://<redacted>@proxy.corp.example:3128
 ```
 
-## Guardrail evaluation
-Before this round of fixes (all 50 prompts then in the corpus, deployed 0.1.0 image of the previous commit):
+## Image scan (`scripts/scan-images.sh`, Trivy 0.58.1 by digest, `--severity CRITICAL,HIGH --ignore-unfixed`)
+The unmodified base image, `python:3.12.16-slim-bookworm`:
 ```text
-MISS b02  dev      benign    near-miss          HTTP 403 blocked {'inj_ignore_previous': 1}
-MISS b03  dev      benign    near-miss          HTTP 403 blocked {'inj_reveal_system_prompt': 1}
-MISS p05  dev      pii       card-after-number  HTTP 200 allow rules={} leaked=['<19 chars>']
-MISS p07  dev      pii       secret             HTTP 200 allow rules={} leaked=['<36 chars>']
-MISS p13  heldout  pii       us-phone           HTTP 200 allow rules={} leaked=['<8 chars>']
-MISS p18  heldout  pii       dotted-phone       HTTP 200 allow rules={} leaked=['<13 chars>']
-MISS i04  dev      injection system-role        HTTP 200 allow rules={}
-MISS i05  dev      injection role-trick         HTTP 200 allow rules={'inj_role_override': 1}
-MISS i07  dev      injection korean             HTTP 200 allow rules={}
-MISS i11  heldout  injection classic            HTTP 200 allow rules={}
-MISS i12  heldout  injection role-trick         HTTP 200 allow rules={}
-MISS i13  heldout  injection fake-tag           HTTP 200 allow rules={'inj_fake_system_tag': 1}
-MISS i14  heldout  injection korean             HTTP 200 allow rules={}
-MISS i15  heldout  injection assistant-role     HTTP 200 allow rules={}
-MISS i16  heldout  injection prompt-leak        HTTP 200 allow rules={}
-MISS i17  heldout  injection obfuscated         HTTP 200 allow rules={}
-  false positives (benign blocked or redacted): 2/9 = 22%
-  false negatives, PII not redacted:            2/8 = 25%
-  false negatives, injection not blocked:       3/8 = 38%
-  false positives (benign blocked or redacted): 0/10 = 0%
-  false negatives, PII not redacted:            2/8 = 25%
-  false negatives, injection not blocked:       7/7 = 100%
-[all] 50 prompts
-  false positives (benign blocked or redacted): 2/19 = 11%
-  false negatives, PII not redacted:            4/16 = 25%
-  false negatives, injection not blocked:       10/15 = 67%
+/scan/base.tar (debian 12.15)
+Total: 4 (HIGH: 4, CRITICAL: 0)
+libpam-modules / libpam-modules-bin / libpam-runtime / libpam0g   CVE-2025-6020   HIGH   fixed   1.5.2-6+deb12u2 -> 1.5.2-6+deb12u3
 ```
-After (60 prompts; see the README for how to read the splits):
+Both application images, which now upgrade those four packages:
 ```text
-MISS i13  heldout  injection fake-tag           HTTP 200 allow rules={'inj_fake_system_tag': 1}
-MISS i17  heldout  injection obfuscated         HTTP 200 allow rules={}
-MISS f08  fresh    injection fake-tag           HTTP 200 allow rules={}
-MISS f10  fresh    injection other-language     HTTP 200 allow rules={}
+/scan/gateway.tar (debian 12.15)     Total: 0 (HIGH: 0, CRITICAL: 0)
+/scan/mock-llm.tar (debian 12.15)    Total: 0 (HIGH: 0, CRITICAL: 0)
+==> no fixable HIGH or CRITICAL findings
+```
+Python packages are scanned too; the earlier findings (three starlette CVEs) went away with the version bumps. Unfixed findings are not counted (`--ignore-unfixed`), and the scanner sees only what its database knew on that day.
 
-[dev] 25 prompts
-  false positives (benign blocked or redacted): 0/9 = 0%
-  false negatives, PII not redacted:            0/8 = 0%
-  false negatives, injection not blocked:       0/8 = 0%
-[heldout] 25 prompts
-  false positives (benign blocked or redacted): 0/10 = 0%
-  false negatives, PII not redacted:            0/8 = 0%
-  false negatives, injection not blocked:       2/7 = 29%
-[fresh] 10 prompts
-  false positives (benign blocked or redacted): 0/4 = 0%
-  false negatives, PII not redacted:            0/3 = 0%
-  false negatives, injection not blocked:       2/3 = 67%
-[all] 60 prompts
-  false positives (benign blocked or redacted): 0/23 = 0%
-  false negatives, PII not redacted:            0/19 = 0%
-  false negatives, injection not blocked:       4/18 = 22%
+## k3s on Ubuntu
+A second, different cluster: single-node k3s v1.37.2+k3s1 on Ubuntu 26.04.1 LTS (kernel 6.18 under WSL2, 12 CPUs, 7.6 GiB), containerd 2.3.7-k3s1, Helm v4.3.2,
+2026-11-27. No kind and no Docker on that host: the images were built elsewhere and moved as a tarball (checksum verified on arrival, then
+`k3s ctr images import`, no registry). The ingress controller is k3s's bundled Traefik. This run used the repository at commit `d73fb35`; the
+fixes it found are in `978f8db`. The later changes in this file (guardrail rules, Dockerfiles, chart options, scripts) were verified on kind, not re-run on k3s.
+
+Install: `networkPolicy.allowedNamespaces={kube-system}`, because Traefik lives in `kube-system`; everything else is the default chart.
+```text
+PASS  kubernetes version           server v1.37.2+k3s1 (need >= 1.27); Client Version: v1.37.2+k3s1
+PASS  node readiness               1/1 nodes Ready
+PASS  default storageclass         local-path
+PASS  ingress controller           IngressClass: traefik
+PASS  cluster dns                  1/1 kube-dns pods ready (label k8s-app=kube-dns)
+...
+POD LOGS: guardrail-smoke-test (smoke)
+PASS readyz is 200  /  PASS policy version matches release  /  PASS chat returns 200  /  PASS email redacted before upstream
+PASS X-Request-ID header present  /  PASS output guardrail redacts upstream leak  /  PASS prompt injection blocked with 403
+```
+**helm test: 7/7.** No request was sent through a Traefik Ingress; only the IngressClass was found. The first preflight on stock Ubuntu had 11 PASS and 2 WARN: it did
+not recognise the k3s network policy controller and could not interpret what the enforcement probe saw (below).
+
+**NetworkPolicy enforcement (drill 6), with the policy off and on.** Same drill, same pods; the only change is `networkPolicy.enabled`:
+```text
+## policy OFF
+    | CONNECTED 200
+    | CONNECTED 200
+control  -> ok   (expected: ok)
+outsider -> connected
+## policy ON
+    | CONNECTED 200
+    | ERROR URLError <urlopen error [Errno 111] Connection refused>
+control  -> ok   (expected: ok)
+outsider -> inconclusive        <- first version of the drill: it only accepted a timeout
+```
+k3s does not drop, it rejects. The reason is visible in the iptables rules its embedded kube-router writes:
+```text
+KUBE-NWPLCY rules: 65
+-A KUBE-POD-FW-... -m comment --comment "guardrail/guardrail-gateway-... reject" -m mark ! --mark 0x10000/0x10000 -j REJECT --reject-with icmp-port-unreachable
+```
+Both the drill and the preflight probe now accept "refused" as a block, but only because the control pod reached the same Service moments earlier (so the
+gateway was listening). With that change:
+```text
+control  -> ok   (expected: ok)
+outsider -> blocked (rejected (connection refused))  (expected: blocked)
+PASS: NetworkPolicy is enforced by this cluster: traffic rejected (connection refused) while the control got through
+PASS  networkpolicy enforcement    active probe: fetch worked before deny-all (control) and was REFUSED after it (rejected)
+Summary: 13 PASS, 0 WARN, 0 FAIL
 ```
 
-## Image scan
-`docker run aquasec/trivy:0.58.1 image --severity CRITICAL,HIGH --ignore-unfixed` on the first image: Python packages **Total: 3 (HIGH: 3)**, all
-starlette 0.41.3 (CVE-2025-62727, CVE-2026-48818, CVE-2026-54283), plus Debian perl packages. After bumping the pins and the base image (log
-`2026-11-27T03:20Z`): **Total: 4 (HIGH: 4)**, all `libpam*` 1.5.2-6+deb12u2 (fixed in deb12u3), no Python findings.
+**Break and fix on k3s.** Stopping the k3s service and starting it again: API back after 12 s, gateway pods Ready after 14 s. The OOMKilled
+drill (gateway memory limit 20Mi) gives `Last State: Terminated, Reason: OOMKilled, Exit Code: 137` and restores cleanly. The config-drift drill reproduces the
+Helm 4 conflict (field managers `helm`, `kubectl-set`, `k3s`) and restores. Upgrade and rollback: a policy change to `pii.mode=block` returns 403, the rollback returns 200.
+
+**An incident that was not planned.** Mid-run the API server disappeared (`ServiceUnavailable`). `journalctl` showed systemd stopping the user session and every
+`cri-containerd-*.scope` at 12:32:57, PID 1 restarting at 12:33:33, and k3s logging "Waiting for containerd startup" until 12:34:21, when the API was ready again (about 80 s).
+Cause: WSL shuts a distro down when no session is attached, even with systemd services running; it is the host, not Kubernetes. The cluster recovered by itself (pods restarted once,
+then Ready). On a real server this does not apply.
+
+## Not verified
+- The Anthropic adapter against the real API (mocked-transport unit tests only; the request carries `max_tokens` and `output_config.effort` as documented, untested live).
+- Helm 3, TLS on the ingress, proxy and private-CA settings, `imagePullSecrets`: rendered and schema-checked only.
+- A request through a Traefik Ingress on k3s.
+- The GitHub Actions workflow, which has not run on GitHub.
+- Drills 2, 3, 5 and 8 and the 150-second availability loop on the final build (captured earlier the same day, see above).

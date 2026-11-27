@@ -14,6 +14,8 @@ Placeholders: namespace `guardrail`, release name `guardrail`. Change them consi
 | API-key Secret | Secret | Only when an external LLM is used |
 | NetworkPolicies | 5 objects | Default deny, plus explicit allows |
 
+`gateway` and `mockLlm` also take `nodeSelector`, `tolerations` and `podAnnotations`.
+
 Default resource requests: gateway 100m CPU / 128Mi x 2 replicas, mock LLM 50m / 64Mi. Total about 250m CPU and 320Mi.
 
 ## 2. Prerequisites
@@ -25,7 +27,9 @@ Default resource requests: gateway 100m CPU / 128Mi x 2 replicas, mock LLM 50m /
   (the chart uses `before-hook-creation` only, because `hook-succeeded` together with `helm test --logs` is reported to fail on Helm 3, helm/helm#9098; not tested here).
 - A CNI plugin that **enforces** NetworkPolicy (for example Calico or Cilium). Accepting the objects is not enough; see section 3.
 - Container images available to the nodes (public registry, private registry, or the offline bundle in section 5).
-- Optional: an ingress controller (only for `ingress.enabled=true`).
+- Optional: an ingress controller (only for `ingress.enabled=true`). The chart's Ingress is controller-agnostic (`ingress.className`). The kind
+  rehearsal uses ingress-nginx, which was retired upstream in March 2026 and gets no further fixes; use your site's supported controller
+  (on k3s the bundled Traefik was present and preflight found its IngressClass, see [EVIDENCE.md](EVIDENCE.md); no request was sent through a Traefik Ingress).
 - For an external LLM: outbound HTTPS from the namespace to the provider, and the provider's IP ranges for the egress allowlist.
 
 ## 3. Environment assessment
@@ -39,8 +43,9 @@ REGISTRY_URL=https://registry.customer.local/v2/ scripts/preflight.sh        # t
 ```
 It checks: Kubernetes version, RBAC for everything `helm install/upgrade/test` creates (including pods, PDBs and Helm's release Secrets), node
 readiness and CPU architecture, schedulable capacity (allocatable minus what is already requested), default StorageClass (informational; the
-chart is stateless), ingress controller, cluster DNS (found by the `k8s-app=kube-dns` label), Pod Security Admission level of the namespace,
-NetworkPolicy support, registry reachability and egress to the LLM endpoint.
+chart is stateless), ingress controller, cluster DNS (found by the `k8s-app=kube-dns` label), Pod Security Admission (the chart is sent to the API
+server as a server-side dry run into the target namespace, so that namespace's own labels decide), NetworkPolicy support, registry reachability and
+egress to the LLM endpoint.
 
 The NetworkPolicy probe fetches a file from a server pod **before** a deny-all policy exists (positive control: if that fails, the result is
 "inconclusive", never a pass) and then requires the fetch to **time out** after it. The last two checks run from the workstation: repeat them
@@ -68,7 +73,9 @@ helm upgrade --install guardrail charts/llm-guardrail -n guardrail \
   --set 'networkPolicy.externalLLM.cidrs={<ip-or-cidr>,<ip-or-cidr>}' --wait
 ```
 Notes: NetworkPolicy matches IP ranges, not hostnames, so provider IP changes require updating the list; consider an egress proxy or a CNI
-with FQDN policies if the provider's addresses change often. The model id is `gateway.upstream.model` (default `claude-haiku-5-5`).
+with FQDN policies if the provider's addresses change often. The model id is `gateway.upstream.model` (default `claude-haiku-5-5`). Current Claude models think by default and thinking tokens count against
+`max_tokens`, so the gateway sends `gateway.upstream.maxTokens` (4096) and a low `gateway.upstream.effort`; raise `maxTokens` if answers come back
+empty (the log says `stop_reason=max_tokens`). A model refusal is returned as `502 upstream_refused`.
 Prefer `existingSecret` to `gateway.secret.apiKey`: a key passed to Helm is stored in the release history. **The Anthropic adapter has only been
 tested against a mocked transport, not the real API.**
 
@@ -93,8 +100,8 @@ prove who built the bundle. For that, send the checksum over a separate trusted 
 scripts/airgap-install.sh dist/llm-guardrail-airgap-<version>.tar.gz
 ```
 The script verifies the outer checksum and then the internal ones, loads the images, starts a private registry, pushes the images, and
-installs the chart with `global.imageRegistry` pointing at that registry. It ends by printing the pod image names and the kubelet "Pulled"
-events that name the registry: that, not network isolation, is the evidence the nodes used the bundle. At a real customer site you would push the images to their existing
+installs the chart with `global.imageRegistry` pointing at that registry. It ends by printing the pod image names and the registry's own access log (manifest and blob requests from the nodes): that, not network
+isolation, is the evidence the nodes used the bundle. Blob requests appear only when the nodes did not already hold the layers. The script configures kind nodes; at a real customer site you push the images to their existing
 registry (`docker load`, `docker tag`, `docker push`) and run `helm upgrade --install ... -f values-airgapped.yaml --set global.imageRegistry=<registry>`.
 Use the mock LLM, or an LLM endpoint inside the site's network (`gateway.upstream.url`), and keep `networkPolicy.externalLLM.enabled=false`.
 
@@ -113,21 +120,24 @@ For a full check from the repository: `REQUIRE_CLUSTER=1 pytest tests/integratio
 
 ## 7. Integrating applications
 - **Address:** `http://guardrail-gateway.guardrail.svc.cluster.local/v1/chat` (port 80). Request: `{"messages":[{"role":"user","content":"..."}]}`;
-  roles are `system`, `user`, `assistant`. All roles are screened; at most 50 messages and 100,000 characters in total.
+  roles are `system`, `user`, `assistant`. All roles are screened; at most 50 messages, 20,000 characters per message, 100,000 characters in total
+  and a 1 MiB request body (`413 request_too_large` beyond that, before the body is read into memory). The gateway does not authenticate callers and
+  does not rate-limit: access is controlled by the NetworkPolicy alone, so put an authenticating, rate-limiting proxy in front if callers are untrusted.
 - **Who may call it:** pods in namespaces listed in `networkPolicy.allowedNamespaces` (matched on the `kubernetes.io/metadata.name` label; default
   `ingress-nginx`). Add the application's namespace: `--set 'networkPolicy.allowedNamespaces={ingress-nginx,payments}'`.
 - **Ingress:** `--set ingress.enabled=true --set ingress.host=guardrail.example.internal` (class `nginx`). Only `/v1` is routed; `/metrics`,
   `/readyz` and `/healthz` answer 404 through the ingress. For TLS set `ingress.tls.enabled=true` and `ingress.tls.secretName` (an existing
   `kubernetes.io/tls` Secret); TLS was **not** exercised here, only rendered. Without it the ingress is plain HTTP.
 - **Response handling:** `200` allowed or redacted (`decision` tells which); `403` blocked (`reason`: `pii` or `prompt_injection`, with the matching rule
-  ids); `422` invalid request; `502` upstream failed; `504` upstream timed out. Always log `request_id` on the application side: support can find the
+  ids); `413` body too large; `422` invalid request; `502` upstream failed or the model refused; `504` upstream timed out. Always log `request_id` on the application side: support can find the
   matching gateway log line.
 - **Policy:** edit the `policy:` section of your values (`pii.mode: redact|block`, rules, injection threshold) and run `helm upgrade`; pods roll
   automatically and `policy.version` is returned on every response. A policy file that is not valid YAML leaves the pod NotReady with a log line
   saying why, instead of crash-looping.
 - **Observability:** logs are JSON on stdout (`kubectl logs`); Prometheus metrics at `/metrics` (`gateway_requests_total`, `gateway_rule_hits_total`,
-  `gateway_upstream_errors_total`, `gateway_upstream_latency_seconds`) reachable inside the cluster or by port-forward.
-- **Readiness semantics:** a gateway pod is Ready only when its policy loaded **and** the upstream answered recently. If the single upstream goes
+  `gateway_upstream_errors_total`, `gateway_upstream_latency_seconds`) reachable inside the cluster or by port-forward. A Prometheus in another namespace is blocked by the default-deny policy: add its namespace to
+  `networkPolicy.allowedNamespaces` (the policy is per port, and the metrics share the API port, so that namespace can call `/v1/chat` too).
+- **Readiness semantics:** a gateway pod is Ready only when its policy loaded **and** the upstream answered the probe's own check (nothing is cached: every readiness probe asks the upstream). If the single upstream goes
   away, all gateway replicas leave the Service together (see the trade-off in ARCHITECTURE.md).
 
 ## 8. Upgrade and rollback
@@ -174,6 +184,7 @@ The chart creates no persistent volumes. Secrets you created yourself (`kubectl 
 | Name resolution errors in gateway logs | Egress policy without DNS rule, or DNS down | `kubectl -n kube-system get pods -l k8s-app=kube-dns` | Restore DNS egress. Drill 3 |
 | `helm upgrade` fails with "conflict with kubectl-..." | A hand edit owns a field Helm wants to set | `kubectl get <obj> --show-managed-fields` | Drill 7 |
 | `kubectl drain` hangs, "violate the pod's disruption budget" | A budget is holding the last Ready replica; replacements cannot schedule | `kubectl get pdb -A`; `kubectl describe pod <pending>` | Drill 8 |
+| `ImagePullBackOff` ("pull access denied") although the image is on the node | The kubelet keeps records of images it pulled itself; an image it pulled from one registry name (the air-gap registry) and that was later loaded out of band under another name (`kind load`) is checked against the registry again and fails | `ls /var/lib/kubelet/image_manager/pulled` on the node; `crictl images` shows the image | Use one delivery path per cluster. To recover a lab node: delete those record files and restart the kubelet (found on kind, 2026-11-27) |
 | Policy change not applied | Edited the ConfigMap by hand instead of via Helm | `kubectl get pods` ages; `helm get values` | Change values and `helm upgrade` (checksum rolls pods) |
 | `helm install` fails with a schema or `fail` error | Invalid or inconsistent value | Message names the field | Correct the value |
 
