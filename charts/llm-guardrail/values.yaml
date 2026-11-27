@@ -95,9 +95,9 @@ ingress:
     enabled: false
     secretName: "" # an existing kubernetes.io/tls Secret
 
+# Not configurable, always allowed in: pods in THIS namespace labelled guardrail-client=true (the helm test pod, drills).
 networkPolicy:
   enabled: true
-  # Pods in THIS namespace labelled guardrail-client=true may also call the gateway (the helm test pod, drills).
   # DNS egress for the gateway and client pods. Leave true; the DNS drill sets it false to reproduce an outage.
   allowDns: true
   # Namespaces whose pods may call the gateway (matched on kubernetes.io/metadata.name).

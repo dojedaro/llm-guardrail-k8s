@@ -24,7 +24,7 @@ if ! docker image inspect "llm-guardrail/gateway:$NEW_TAG" >/dev/null 2>&1; then
   log "building gateway $NEW_TAG"
   docker build -q --build-arg "GATEWAY_VERSION=$NEW_TAG" -t "llm-guardrail/gateway:$NEW_TAG" "$REPO_ROOT/app/gateway" >/dev/null
 fi
-kind load docker-image --name "$CLUSTER_NAME" "llm-guardrail/gateway:$NEW_TAG" >/dev/null
+load_images "llm-guardrail/gateway:$NEW_TAG" >/dev/null
 
 up() { helm upgrade "$RELEASE" "$CHART" -n "$NS" -f "$WORK/base.yaml" --wait --timeout 240s "$@" >/dev/null; }
 
