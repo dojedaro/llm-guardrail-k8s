@@ -14,7 +14,7 @@ helm status "$RELEASE" -n "$NS" >/dev/null 2>&1 || die "release '$RELEASE' not f
 verify() { # verify <expected-version> <expected-http-status-for-email>
   local want_ver="$1" want_status="$2" ready status
   ready="$(curl -s "http://127.0.0.1:$PORT/readyz")"
-  status="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/v1/chat" \
+  status="$(curl -s -o "$DEVNULL" -w '%{http_code}' "http://127.0.0.1:$PORT/v1/chat" \
     -H 'content-type: application/json' \
     -d '{"messages":[{"role":"user","content":"my email is jane@example.com"}]}')"
   echo "    readyz: $ready"

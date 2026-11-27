@@ -4,8 +4,15 @@
 # Git Bash on Windows rewrites arguments that look like Unix paths (e.g. /healthz) before
 # passing them to native programs such as kubectl. Turn that off.
 export MSYS_NO_PATHCONV=1
+# ...which also stops /dev/null being translated for native Windows curl, so give curl -o
+# the right null device for the platform.
+DEVNULL=/dev/null
+if command -v cygpath >/dev/null 2>&1; then DEVNULL=NUL; fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Git Bash on Windows: native tools (kind.exe, helm.exe, kubectl.exe) cannot open /c/... paths,
+# so use the mixed form C:/... there. No-op on Linux/macOS.
+if command -v cygpath >/dev/null 2>&1; then REPO_ROOT="$(cygpath -m "$REPO_ROOT")"; fi
 CHART="$REPO_ROOT/charts/llm-guardrail"
 
 # Defaults, override with environment variables.
@@ -66,7 +73,7 @@ pf_start() {
   trap pf_stop EXIT
   local i
   for i in $(seq 1 30); do
-    curl -s -o /dev/null -m 1 "http://127.0.0.1:$port/healthz" && return 0
+    curl -s -o "$DEVNULL" -m 1 "http://127.0.0.1:$port/healthz" && return 0
     sleep 1
   done
   die "port-forward to $(gateway_svc) did not become ready"

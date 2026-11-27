@@ -123,12 +123,12 @@ YAML
 fi
 
 # 9. Image registry reachable from where this script runs.
-code="$(curl -s -o /dev/null -m 6 -w '%{http_code}' "$REGISTRY_URL" || true)"
+code="$(curl -s -o "$DEVNULL" -m 6 -w '%{http_code}' "$REGISTRY_URL" || true)"
 if [[ "$code" != "000" && -n "$code" ]]; then emit PASS "registry reachable" "$REGISTRY_URL -> HTTP $code (401 is normal for registries)"
 else emit WARN "registry reachable" "$REGISTRY_URL unreachable from this host; use the air-gapped bundle (docs/DEPLOYMENT_GUIDE.md)"; fi
 
 # 10. Egress to the upstream LLM API. Any HTTP status proves DNS + routing + TLS work.
-code="$(curl -s -o /dev/null -m 6 -w '%{http_code}' "$UPSTREAM_URL" || true)"
+code="$(curl -s -o "$DEVNULL" -m 6 -w '%{http_code}' "$UPSTREAM_URL" || true)"
 if [[ "$code" != "000" && -n "$code" ]]; then emit PASS "egress to upstream llm" "$UPSTREAM_URL -> HTTP $code"
 elif [[ "${EXTERNAL_LLM:-0}" == "1" ]]; then emit FAIL "egress to upstream llm" "$UPSTREAM_URL unreachable: open the egress path before installing"
 else emit WARN "egress to upstream llm" "$UPSTREAM_URL unreachable (fine for mock/air-gapped installs)"; fi

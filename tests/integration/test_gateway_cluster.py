@@ -2,16 +2,34 @@
 
 from __future__ import annotations
 
+import json
 import re
+import shutil
+import subprocess
+import time
 import uuid
+from pathlib import Path
 
 import pytest
 
 from .conftest import NS, RELEASE, kubectl
 
+CHART = str(Path(__file__).resolve().parents[2] / "charts" / "llm-guardrail")
+
 
 def chat(client, text: str, **headers):
     return client.post("/v1/chat", json={"messages": [{"role": "user", "content": text}]}, headers=headers)
+
+
+def chat_until(client, status: int, timeout_s: float = 30.0):
+    """`rollout status` returns while old pods are still draining, and the gateway's pooled
+    keep-alive connection can still reach one of them. Poll until the new behaviour shows."""
+    deadline = time.time() + timeout_s
+    while True:
+        r = chat(client, "hello")
+        if r.status_code == status or time.time() > deadline:
+            return r
+        time.sleep(1)
 
 
 def metric(client, name: str, labels: str = "") -> float:
@@ -60,18 +78,32 @@ def test_metrics_increment(client):
     assert metric(client, "gateway_requests_total", '{decision="redacted"}') == before + 1
 
 
-@pytest.mark.parametrize(("env", "status"), [("MOCK_ERROR_RATE=1", 502), ("MOCK_LATENCY_MS=15000", 504)])
-def test_upstream_failure_codes(client, env, status):
-    """Break the mock LLM with a temporary env var, expect 502/504 plus a request id, then repair it."""
-    mock = f"deploy/{RELEASE}-mock-llm"
-    reset = ["MOCK_ERROR_RATE=0", "MOCK_LATENCY_MS=0"]
+def helm(*args: str) -> str:
+    return subprocess.run(["helm", *args], capture_output=True, text=True, timeout=240, check=True).stdout
+
+
+@pytest.mark.parametrize(
+    ("fault", "status"),
+    [
+        (["--set", "mockLlm.faults.errorRate=1"], 502),
+        (["--set", "mockLlm.faults.latencyMs=15000", "--set", "gateway.upstream.timeoutSeconds=3"], 504),
+    ],
+)
+def test_upstream_failure_codes(client, fault, status):
+    """Break the mock LLM through Helm, expect 502/504 plus a request id, then roll back.
+
+    Faults go through `helm upgrade`, never `kubectl set env`: editing Helm-managed objects by
+    hand makes kubectl the owner of those fields and the next server-side `helm upgrade` fails
+    with a conflict (see drills/07-config-drift.md)."""
+    if not shutil.which("helm"):
+        pytest.skip("helm not installed")
+    history = json.loads(helm("history", RELEASE, "-n", NS, "-o", "json"))
+    healthy = str(history[-1]["revision"])
     try:
-        kubectl("-n", NS, "set", "env", mock, env)
-        kubectl("-n", NS, "rollout", "status", mock, "--timeout=90s")
-        r = chat(client, "hello")
+        helm("upgrade", RELEASE, CHART, "-n", NS, "--reuse-values", *fault, "--wait", "--timeout", "180s")
+        r = chat_until(client, status)
         assert r.status_code == status
         assert r.json()["request_id"] == r.headers["x-request-id"]
     finally:
-        kubectl("-n", NS, "set", "env", mock, *reset)
-        kubectl("-n", NS, "rollout", "status", mock, "--timeout=90s")
-    assert chat(client, "hello again").status_code == 200
+        helm("rollback", RELEASE, healthy, "-n", NS, "--wait", "--timeout", "180s")
+    assert chat_until(client, 200).status_code == 200
