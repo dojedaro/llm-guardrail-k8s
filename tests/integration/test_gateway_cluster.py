@@ -10,9 +10,10 @@ import time
 import uuid
 from pathlib import Path
 
+import httpx
 import pytest
 
-from .conftest import NS, RELEASE, kubectl
+from .conftest import LOCAL_PORT, NS, RELEASE, forward, kubectl, skip_or_fail
 
 CHART = str(Path(__file__).resolve().parents[2] / "charts" / "llm-guardrail")
 
@@ -89,21 +90,61 @@ def helm(*args: str) -> str:
         (["--set", "mockLlm.faults.latencyMs=15000", "--set", "gateway.upstream.timeoutSeconds=3"], 504),
     ],
 )
-def test_upstream_failure_codes(client, fault, status):
+def test_upstream_failure_codes(fault, status, tmp_path):
     """Break the mock LLM through Helm, expect 502/504 plus a request id, then roll back.
 
     Faults go through `helm upgrade`, never `kubectl set env`: editing Helm-managed objects by
     hand makes kubectl the owner of those fields and the next server-side `helm upgrade` fails
     with a conflict (see drills/07-config-drift.md)."""
     if not shutil.which("helm"):
-        pytest.skip("helm not installed")
+        skip_or_fail("helm not installed")
     history = json.loads(helm("history", RELEASE, "-n", NS, "-o", "json"))
-    healthy = str(history[-1]["revision"])
+    healthy = str(next(h["revision"] for h in reversed(history) if h["status"] == "deployed"))
+    values = tmp_path / "base.yaml"
+    values.write_text(helm("get", "values", RELEASE, "-n", NS, "-o", "yaml").replace("null", "{}"))
     try:
-        helm("upgrade", RELEASE, CHART, "-n", NS, "--reuse-values", *fault, "--wait", "--timeout", "180s")
-        r = chat_until(client, status)
-        assert r.status_code == status
-        assert r.json()["request_id"] == r.headers["x-request-id"]
+        # Explicit baseline values, not --reuse-values (which would also freeze old chart defaults).
+        helm("upgrade", RELEASE, CHART, "-n", NS, "-f", str(values), *fault, "--wait", "--timeout", "180s")
+        with forward(LOCAL_PORT + 1) as url, httpx.Client(base_url=url, timeout=25) as c:
+            r = chat_until(c, status)
+            assert r.status_code == status
+            assert r.json()["request_id"] == r.headers["x-request-id"]
     finally:
         helm("rollback", RELEASE, healthy, "-n", NS, "--wait", "--timeout", "180s")
-    assert chat_until(client, 200).status_code == 200
+    with forward(LOCAL_PORT + 1) as url, httpx.Client(base_url=url, timeout=25) as c:
+        assert chat_until(c, 200).status_code == 200
+
+
+def test_security_context_is_enforced_on_the_running_pod():
+    """The chart claims non-root, read-only rootfs and no capabilities: check the live pod, not the template."""
+    out = kubectl(
+        "-n",
+        NS,
+        "exec",
+        f"deploy/{RELEASE}-gateway",
+        "--",
+        "sh",
+        "-c",
+        "id -u; touch /app/x 2>&1; touch /tmp/ok && echo tmp-ok",
+        check=False,
+    ).stdout
+    assert out.splitlines()[0] == "10001"
+    assert "Read-only file system" in out or "Permission denied" in out
+    assert "tmp-ok" in out
+
+
+def test_ingress_exposes_only_the_api():
+    """Needs the release installed with values-kind.yaml (ingress on, host port 8080 mapped by kind)."""
+    host = {"Host": "guardrail.localtest.me"}
+    try:
+        r = httpx.post(
+            "http://127.0.0.1:8080/v1/chat",
+            headers=host,
+            timeout=5,
+            json={"messages": [{"role": "user", "content": "hi"}]},
+        )
+    except httpx.HTTPError as exc:
+        return skip_or_fail(f"ingress not reachable on localhost:8080: {exc}")
+    assert r.status_code == 200
+    for path in ("/metrics", "/readyz", "/healthz"):
+        assert httpx.get(f"http://127.0.0.1:8080{path}", headers=host, timeout=5).status_code == 404, path

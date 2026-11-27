@@ -11,18 +11,19 @@ if [[ "${1:-}" == "restore" ]]; then
   exit 0
 fi
 MODE="${1:-missing}"
-
-drill_begin
 case "$MODE" in
   missing) SECRET=does-not-exist ;;
-  wrongkey)
-    SECRET=drill-wrong-key
-    kubectl -n "$NS" create secret generic "$SECRET" --from-literal=token=placeholder-not-a-real-key
-    ;;
-  *) drill_restore; die "unknown mode '$MODE' (missing|wrongkey)" ;;
+  wrongkey) SECRET=drill-wrong-key ;;
+  *) die "unknown mode '$MODE' (missing|wrongkey)" ;;   # validate BEFORE touching the release
 esac
+
+drill_begin
+[[ "$MODE" == wrongkey ]] && kubectl -n "$NS" create secret generic "$SECRET" --from-literal=token=placeholder-not-a-real-key
+# The chart refuses anthropic without an egress allowlist; a documentation-range address that is never contacted.
 helm_break --set gateway.upstream.kind=anthropic --set gateway.upstream.url=https://api.anthropic.com \
-  --set "gateway.secret.existingSecret=$SECRET" --set gateway.secret.key=api-key
-sleep 15
+  --set "gateway.secret.existingSecret=$SECRET" --set gateway.secret.key=api-key \
+  --set networkPolicy.externalLLM.enabled=true --set 'networkPolicy.externalLLM.cidrs={203.0.113.10/32}'
+wait_until 120 "a gateway pod in CreateContainerConfigError" \
+  gateway_field_matches '{..waiting.reason}' 'CreateContainerConfigError'
 kubectl -n "$NS" get pods -l app.kubernetes.io/name=gateway
 banner "API-key Secret problem, mode=$MODE" 05-missing-secret.md

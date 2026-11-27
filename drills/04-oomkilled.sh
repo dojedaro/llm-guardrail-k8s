@@ -6,6 +6,8 @@ source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 
 drill_begin
 helm_break --set gateway.resources.limits.memory=20Mi --set gateway.resources.requests.memory=16Mi
-sleep 30
+wait_until 180 "a gateway container terminated with OOMKilled" \
+  gateway_field_matches '{..lastState.terminated.reason}' 'OOMKilled'
+wait_until 120 "CrashLoopBackOff" gateway_field_matches '{..waiting.reason}' 'CrashLoopBackOff' || true
 kubectl -n "$NS" get pods -l app.kubernetes.io/name=gateway
 banner "gateway memory limit 20Mi" 04-oomkilled.md

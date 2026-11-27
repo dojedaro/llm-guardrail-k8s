@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# Customer environment assessment. Read-only: it only runs `kubectl get/auth` and `curl`.
-# Prints PASS / WARN / FAIL per check and saves the same report to reports/preflight-<time>.txt
-# so it can be attached to the deployment ticket.
+# Customer environment assessment. Read-only apart from the optional NetworkPolicy probe (PROBE_NETPOL=1),
+# which creates and deletes a temporary namespace. Prints PASS / WARN / FAIL per check and saves the same
+# report to reports/preflight-<time>.txt so it can be attached to the deployment ticket.
 #
 # Settings (environment variables):
 #   NS=guardrail                         target namespace
 #   UPSTREAM_URL=https://api.anthropic.com   external LLM endpoint to test (EXTERNAL_LLM=1 makes failure a FAIL)
 #   REGISTRY_URL=https://registry-1.docker.io/v2/   registry to test (use the private one for air-gapped sites)
 #   NEED_CPU_M=250 NEED_MEM_MI=320       what the chart requests with default values
-#   PROBE_NETPOL=1                       also run an active NetworkPolicy enforcement probe (creates a temp namespace)
+#   PROBE_NETPOL=1                       also run an active NetworkPolicy enforcement probe
+#   PROBE_IMAGE=busybox:1.36.1           image for the probe pods (must be pullable by the cluster)
 set -uo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 need kubectl curl awk
@@ -28,9 +29,9 @@ emit() { # emit LEVEL "check" "detail"
   case "$1" in PASS) PASS=$((PASS+1));; WARN) WARNS=$((WARNS+1));; FAIL) FAILS=$((FAILS+1));; esac
 }
 
-# Convert Kubernetes quantities to millicores / MiB so we can compare numbers.
-cpu_to_m() { awk '{ if ($1 ~ /m$/) { sub(/m/,"",$1); print $1 } else print $1*1000 }'; }
-mem_to_mi() { awk '{ v=$1; if (v ~ /Ki$/) {sub(/Ki/,"",v); print v/1024} else if (v ~ /Mi$/) {sub(/Mi/,"",v); print v}
+# Convert Kubernetes quantities to millicores / MiB so we can compare numbers. Blank lines are skipped.
+cpu_to_m() { awk 'NF { if ($1 ~ /m$/) { sub(/m/,"",$1); print $1 } else print $1*1000 }'; }
+mem_to_mi() { awk 'NF { v=$1; if (v ~ /Ki$/) {sub(/Ki/,"",v); print v/1024} else if (v ~ /Mi$/) {sub(/Mi/,"",v); print v}
                     else if (v ~ /Gi$/) {sub(/Gi/,"",v); print v*1024} else print v/1048576 }'; }
 
 {
@@ -54,27 +55,38 @@ else
   emit FAIL "kubernetes version" "server $gitver is older than 1.$MIN_MINOR"
 fi
 
-# 2. Permissions in the target namespace.
+# 2. Permissions in the target namespace: everything `helm install/upgrade/test` creates, including the
+#    Secret Helm itself uses to store release history.
 missing=""
-for verb_res in "create deployments" "create services" "create configmaps" "create secrets" "create networkpolicies"; do
+for verb_res in "create deployments.apps" "create services" "create configmaps" "create secrets" "update secrets" \
+                "create pods" "create networkpolicies.networking.k8s.io" "create poddisruptionbudgets.policy"; do
   kubectl auth can-i $verb_res -n "$NS" >/dev/null 2>&1 || missing+="$verb_res; "
 done
-if [[ -z "$missing" ]]; then emit PASS "rbac in namespace $NS" "can create the objects the chart needs"
+if [[ -z "$missing" ]]; then emit PASS "rbac in namespace $NS" "can create the objects the chart needs (incl. pods, PDBs, Helm release secrets)"
 else emit FAIL "rbac in namespace $NS" "cannot: $missing"; fi
 
-# 3. Node readiness.
+# 3. Node readiness and CPU architecture (the images must match it).
 total="$(kubectl get nodes --no-headers 2>/dev/null | wc -l | tr -d ' ')"
 notready="$(kubectl get nodes --no-headers 2>/dev/null | awk '$2 !~ /^Ready/ {n++} END {print n+0}')"
 if [[ "$total" -gt 0 && "$notready" -eq 0 ]]; then emit PASS "node readiness" "$total/$total nodes Ready"
 else emit FAIL "node readiness" "$notready of $total nodes not Ready"; fi
+archs="$(kubectl get nodes -o jsonpath='{range .items[*]}{.status.nodeInfo.architecture}{"\n"}{end}' | sort -u | paste -sd, -)"
+if [[ "$archs" == *,* ]]; then emit WARN "node architecture" "mixed ($archs): images must be multi-arch or pods need a nodeSelector"
+else emit PASS "node architecture" "$archs (images must be built for this architecture)"; fi
 
-# 4. Capacity: allocatable (not capacity) is what the scheduler can really use.
+# 4. Capacity: allocatable minus what is already REQUESTED by running pods, which is what the scheduler sees.
 alloc_cpu="$(kubectl get nodes -o jsonpath='{range .items[*]}{.status.allocatable.cpu}{"\n"}{end}' | cpu_to_m | awk '{s+=$1} END {print s+0}')"
 alloc_mem="$(kubectl get nodes -o jsonpath='{range .items[*]}{.status.allocatable.memory}{"\n"}{end}' | mem_to_mi | awk '{s+=$1} END {printf "%d", s}')"
-detail="allocatable ${alloc_cpu}m CPU / ${alloc_mem}Mi memory vs chart requests ${NEED_CPU_M}m / ${NEED_MEM_MI}Mi"
-if   [[ "$alloc_cpu" -lt "$NEED_CPU_M" || "$alloc_mem" -lt "$NEED_MEM_MI" ]]; then emit FAIL "capacity" "$detail"
-elif [[ "$alloc_cpu" -lt $((NEED_CPU_M*3)) || "$alloc_mem" -lt $((NEED_MEM_MI*3)) ]]; then emit WARN "capacity" "$detail (less than 3x headroom; other workloads also need room)"
+req_cpu="$(kubectl get pods -A --field-selector=status.phase!=Succeeded,status.phase!=Failed -o jsonpath='{range .items[*]}{range .spec.containers[*]}{.resources.requests.cpu}{"\n"}{end}{end}' | cpu_to_m | awk '{s+=$1} END {print s+0}')"
+req_mem="$(kubectl get pods -A --field-selector=status.phase!=Succeeded,status.phase!=Failed -o jsonpath='{range .items[*]}{range .spec.containers[*]}{.resources.requests.memory}{"\n"}{end}{end}' | mem_to_mi | awk '{s+=$1} END {printf "%d", s}')"
+free_cpu=$((alloc_cpu - req_cpu)); free_mem=$((alloc_mem - req_mem))
+detail="free to schedule ${free_cpu}m CPU / ${free_mem}Mi memory (allocatable ${alloc_cpu}m / ${alloc_mem}Mi minus requested ${req_cpu}m / ${req_mem}Mi) vs chart requests ${NEED_CPU_M}m / ${NEED_MEM_MI}Mi"
+if   [[ "$free_cpu" -lt "$NEED_CPU_M" || "$free_mem" -lt "$NEED_MEM_MI" ]]; then emit FAIL "capacity" "$detail"
+elif [[ "$free_cpu" -lt $((NEED_CPU_M*3)) || "$free_mem" -lt $((NEED_MEM_MI*3)) ]]; then emit WARN "capacity" "$detail (less than 3x headroom)"
 else emit PASS "capacity" "$detail"; fi
+if kubectl get nodes -o jsonpath='{.items[0].spec.providerID}' 2>/dev/null | grep -q '^kind://'; then
+  echo "      note: kind nodes are containers sharing one host; the numbers above are the host's, not independent machines." | tee -a "$REPORT"
+fi
 
 # 5. Default StorageClass (the chart is stateless, so this is informational).
 sc="$(kubectl get storageclass -o jsonpath='{range .items[?(@.metadata.annotations.storageclass\.kubernetes\.io/is-default-class=="true")]}{.metadata.name}{end}' 2>/dev/null)"
@@ -86,53 +98,95 @@ ic="$(kubectl get ingressclass --no-headers 2>/dev/null | awk '{print $1}' | pas
 if [[ -n "$ic" ]]; then emit PASS "ingress controller" "IngressClass: $ic"
 else emit WARN "ingress controller" "no IngressClass found (use port-forward or install a controller)"; fi
 
-# 7. CoreDNS: the gateway resolves the upstream by name, so broken DNS means 502s.
-want="$(kubectl -n kube-system get deploy coredns -o jsonpath='{.spec.replicas}' 2>/dev/null)"
-have="$(kubectl -n kube-system get deploy coredns -o jsonpath='{.status.readyReplicas}' 2>/dev/null)"
-if [[ -n "$want" && "${have:-0}" -ge 1 && "${have:-0}" -eq "$want" ]]; then emit PASS "coredns" "$have/$want ready"
-else emit FAIL "coredns" "ready ${have:-0}/${want:-?} (kubectl -n kube-system get deploy coredns)"; fi
+# 7. Cluster DNS: found by label (CoreDNS pods are labelled k8s-app=kube-dns whatever the Deployment is called).
+dns_ready="$(kubectl -n kube-system get pods -l k8s-app=kube-dns -o jsonpath='{range .items[*]}{.status.containerStatuses[0].ready}{"\n"}{end}' 2>/dev/null | grep -c true)"
+dns_total="$(kubectl -n kube-system get pods -l k8s-app=kube-dns --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+if [[ "$dns_total" -gt 0 && "$dns_ready" -eq "$dns_total" ]]; then emit PASS "cluster dns" "$dns_ready/$dns_total kube-dns pods ready (label k8s-app=kube-dns)"
+else emit FAIL "cluster dns" "ready $dns_ready/$dns_total (kubectl -n kube-system get pods -l k8s-app=kube-dns); if DNS runs elsewhere set networkPolicy.dns.* in the values"; fi
 
-# 8. NetworkPolicy support: identify the CNI. Names alone do not prove enforcement.
+# 8. Pod Security Admission: the chart runs non-root, read-only rootfs, no capabilities, seccomp RuntimeDefault,
+#    so it satisfies the "restricted" profile. A namespace that enforces something stricter than that would block it.
+psa="$(kubectl get ns "$NS" -o jsonpath='{.metadata.labels.pod-security\.kubernetes\.io/enforce}' 2>/dev/null)"
+if kubectl get ns "$NS" >/dev/null 2>&1; then
+  emit PASS "pod security (ns $NS)" "enforce=${psa:-none}; chart complies with the restricted profile"
+else
+  emit PASS "pod security (ns $NS)" "namespace not created yet; chart complies with restricted, so any enforce level up to restricted admits it"
+fi
+
+# 9. NetworkPolicy support: identify the CNI. Names alone do not prove enforcement.
 pods="$(kubectl -n kube-system get pods --no-headers 2>/dev/null | awk '{print $1}')"
 if   grep -qiE 'calico|cilium|antrea|weave' <<<"$pods"; then
-  emit PASS "networkpolicy support" "CNI known to enforce NetworkPolicy: $(grep -oiE 'calico|cilium|antrea|weave' <<<"$pods" | head -1)"
+  emit PASS "networkpolicy support" "CNI known to enforce NetworkPolicy: $(grep -oiE 'calico|cilium|antrea|weave' <<<"$pods" | head -1) (PROBE_NETPOL=1 proves it)"
 elif grep -qi 'kindnet' <<<"$pods"; then
-  emit WARN "networkpolicy support" "kindnet: enforcement depends on its version; prove it with drills/06-networkpolicy-enforcement.sh"
+  emit WARN "networkpolicy support" "kindnet: enforcement depends on its version; prove it with PROBE_NETPOL=1 or drills/06-networkpolicy-enforcement.sh"
 else
-  emit WARN "networkpolicy support" "CNI not recognised; prove enforcement with drills/06 or PROBE_NETPOL=1"
+  emit WARN "networkpolicy support" "CNI not recognised; prove enforcement with PROBE_NETPOL=1 or drills/06"
 fi
+
+# 9b. Active probe. A server pod serves a file; a client must fetch it BEFORE deny-all (positive control: proves the
+#     path works and the images pulled) and must then TIME OUT after deny-all. Any other failure is "inconclusive",
+#     never a pass.
 if [[ "${PROBE_NETPOL:-0}" == "1" ]]; then
-  probe_img="${PROBE_IMAGE:-busybox:1.36.1}"
-  kubectl create ns np-probe >/dev/null 2>&1 || true
-  kubectl -n np-probe run srv --image="$probe_img" --restart=Never --port=8080 -- httpd -f -p 8080 >/dev/null 2>&1
-  kubectl -n np-probe wait --for=condition=Ready pod/srv --timeout=60s >/dev/null 2>&1
-  ip="$(kubectl -n np-probe get pod srv -o jsonpath='{.status.podIP}')"
-  kubectl -n np-probe apply -f - >/dev/null <<'YAML'
+  img="${PROBE_IMAGE:-busybox:1.36.1}"; pns=np-probe
+  kubectl delete ns "$pns" --ignore-not-found --wait=true >/dev/null 2>&1
+  kubectl create ns "$pns" >/dev/null 2>&1
+  probe() { # probe <pod-name>: run a client pod to completion and print wget's output plus its exit code.
+    # (Not `kubectl run -i --rm`: attaching races the container and can lose the output.)
+    local n="$1" phase
+    kubectl -n "$pns" run "$n" --restart=Never --image="$img" --command -- \
+      sh -c "wget -q -T 4 -O- http://$ip:8080/ 2>&1; echo exit=\$?" >/dev/null 2>&1
+    for _ in $(seq 1 60); do
+      phase="$(kubectl -n "$pns" get pod "$n" -o jsonpath='{.status.phase}' 2>/dev/null)"
+      [[ "$phase" == Succeeded || "$phase" == Failed ]] && break
+      sleep 1
+    done
+    kubectl -n "$pns" logs "$n" 2>&1
+    kubectl -n "$pns" delete pod "$n" --wait=false >/dev/null 2>&1
+  }
+  kubectl -n "$pns" run srv --image="$img" --restart=Never --port=8080 --command -- \
+    sh -c 'mkdir -p /www && echo probe-ok > /www/index.html && exec httpd -f -p 8080 -h /www' >/dev/null 2>&1
+  if ! kubectl -n "$pns" wait --for=condition=Ready pod/srv --timeout=90s >/dev/null 2>&1; then
+    emit WARN "networkpolicy enforcement" "probe inconclusive: server pod did not become Ready (image $img pullable?)"
+  else
+    ip="$(kubectl -n "$pns" get pod srv -o jsonpath='{.status.podIP}')"
+    control="$(probe ctl-before)"
+    if ! grep -q 'probe-ok' <<<"$control" || ! grep -q 'exit=0' <<<"$control"; then
+      emit WARN "networkpolicy enforcement" "probe inconclusive: positive control failed before any policy existed: $(tail -2 <<<"$control" | tr '\n' ' ')"
+    else
+      kubectl -n "$pns" apply -f - >/dev/null <<'YAML'
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata: { name: deny-all-ingress }
 spec: { podSelector: {}, policyTypes: [Ingress] }
 YAML
-  sleep 3
-  if kubectl -n np-probe run cli --rm -i --restart=Never --image="$probe_img" -- wget -q -T 4 -O- "http://$ip:8080" >/dev/null 2>&1; then
-    emit FAIL "networkpolicy enforcement" "active probe: traffic still flowed under deny-all (policies are NOT enforced)"
-  else
-    emit PASS "networkpolicy enforcement" "active probe: deny-all blocked traffic"
+      verdict=""
+      for attempt in 1 2 3 4 5; do   # policy programming is asynchronous: allow a few seconds
+        after="$(probe ctl-after-$attempt)"
+        if grep -q 'probe-ok' <<<"$after"; then verdict=flowed; sleep 3
+        elif grep -qi 'timed out' <<<"$after"; then verdict=timeout; break
+        else verdict="other: $(tail -2 <<<"$after" | tr '\n' ' ')"; break; fi
+      done
+      case "$verdict" in
+        timeout) emit PASS "networkpolicy enforcement" "active probe: fetch worked before deny-all (control) and TIMED OUT after it" ;;
+        flowed)  emit FAIL "networkpolicy enforcement" "active probe: traffic still flowed after deny-all (policies are NOT enforced)" ;;
+        *)       emit WARN "networkpolicy enforcement" "probe inconclusive after deny-all: $verdict" ;;
+      esac
+    fi
   fi
-  kubectl delete ns np-probe --wait=false >/dev/null 2>&1
+  kubectl delete ns "$pns" --wait=false >/dev/null 2>&1
 fi
 
-# 9. Image registry reachable from where this script runs.
+# 10. Image registry reachable from where this script runs.
 code="$(curl -s -o "$DEVNULL" -m 6 -w '%{http_code}' "$REGISTRY_URL" || true)"
 if [[ "$code" != "000" && -n "$code" ]]; then emit PASS "registry reachable" "$REGISTRY_URL -> HTTP $code (401 is normal for registries)"
 else emit WARN "registry reachable" "$REGISTRY_URL unreachable from this host; use the air-gapped bundle (docs/DEPLOYMENT_GUIDE.md)"; fi
 
-# 10. Egress to the upstream LLM API. Any HTTP status proves DNS + routing + TLS work.
+# 11. Egress to the upstream LLM API. Any HTTP status proves DNS + routing + TLS work.
 code="$(curl -s -o "$DEVNULL" -m 6 -w '%{http_code}' "$UPSTREAM_URL" || true)"
 if [[ "$code" != "000" && -n "$code" ]]; then emit PASS "egress to upstream llm" "$UPSTREAM_URL -> HTTP $code"
 elif [[ "${EXTERNAL_LLM:-0}" == "1" ]]; then emit FAIL "egress to upstream llm" "$UPSTREAM_URL unreachable: open the egress path before installing"
 else emit WARN "egress to upstream llm" "$UPSTREAM_URL unreachable (fine for mock/air-gapped installs)"; fi
-echo "  (checks 9 and 10 run from this workstation; confirm from a pod in the cluster before go-live)" | tee -a "$REPORT"
+echo "  (the last two checks run from this workstation; confirm from a pod in the cluster before go-live)" | tee -a "$REPORT"
 
 echo "-----------------------------------------------------------------------" | tee -a "$REPORT"
 echo "Summary: $PASS PASS, $WARNS WARN, $FAILS FAIL   (report: $REPORT)" | tee -a "$REPORT"

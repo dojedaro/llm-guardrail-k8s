@@ -4,7 +4,7 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 need docker
 
-docker build -q -t "llm-guardrail/gateway:$IMAGE_TAG"  "$REPO_ROOT/app/gateway"
+docker build -q --build-arg "GATEWAY_VERSION=$IMAGE_TAG" -t "llm-guardrail/gateway:$IMAGE_TAG" "$REPO_ROOT/app/gateway"
 docker build -q -t "llm-guardrail/mock-llm:$IMAGE_TAG" "$REPO_ROOT/app/mock-llm"
 
 if command -v kind >/dev/null 2>&1 && kind get clusters 2>/dev/null | grep -qx "$CLUSTER_NAME"; then

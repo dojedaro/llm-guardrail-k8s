@@ -40,7 +40,8 @@ for pod in $(kubectl -n "$NS" get pods -o name 2>/dev/null | sed 's#pod/##'); do
   save "pods/$pod.previous.log"  kubectl -n "$NS" logs "$pod" --all-containers --previous --tail=500
 done
 
-TAR="$REPO_ROOT/diagnostics-$TS.tar.gz"
-tar -C "$REPO_ROOT" -czf "$TAR" "diagnostics-$TS"
-log "support bundle: $TAR"
-echo "Review it before sending: grep -ri -E 'sk-|password|token' $DIR || echo 'nothing suspicious'"
+# cd + relative names: Git Bash's tar reads "C:/..." as host:path ("Cannot connect to C") if given an absolute Windows path.
+TAR="diagnostics-$TS.tar.gz"
+( cd "$REPO_ROOT" && tar -czf "$TAR" "diagnostics-$TS" )
+log "support bundle: $REPO_ROOT/$TAR"
+echo "Redaction is a safety net, not a guarantee: read the bundle before it leaves your organisation."

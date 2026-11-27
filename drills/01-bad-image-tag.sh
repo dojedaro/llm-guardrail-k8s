@@ -6,6 +6,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 
 drill_begin
 helm_break --set gateway.image.tag=0.1.0-doesnotexist
-sleep 15
+wait_until 120 "a gateway pod in ErrImagePull/ImagePullBackOff" \
+  gateway_field_matches '{..waiting.reason}' 'ErrImagePull|ImagePullBackOff'
 kubectl -n "$NS" get pods -l app.kubernetes.io/name=gateway
 banner "gateway image tag 0.1.0-doesnotexist" 01-bad-image-tag.md

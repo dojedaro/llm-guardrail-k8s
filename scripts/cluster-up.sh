@@ -33,6 +33,10 @@ kubectl wait --for=condition=Ready nodes --all --timeout=300s
 if [[ "$INGRESS" == "1" ]]; then
   log "installing ingress-nginx (kind's documented manifest)"
   kubectl apply -f "$INGRESS_MANIFEST"
+  # The manifest no longer pins the controller to the node that has host ports 80/443 mapped (found on a real run:
+  # it landed on a worker and localhost:8080 was dead). Pin it to the ingress-ready control-plane node ourselves.
+  kubectl -n ingress-nginx patch deployment ingress-nginx-controller --type=merge -p \
+    '{"spec":{"template":{"spec":{"nodeSelector":{"ingress-ready":"true"},"tolerations":[{"key":"node-role.kubernetes.io/control-plane","operator":"Equal","effect":"NoSchedule"}]}}}}'
   kubectl -n ingress-nginx wait --for=condition=ready pod \
     --selector=app.kubernetes.io/component=controller --timeout=240s
 fi
