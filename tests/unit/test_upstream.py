@@ -92,3 +92,49 @@ async def test_anthropic_ping_any_http_response_is_reachable():
         raise httpx.ConnectError("no route")
 
     assert not await AnthropicAdapter("https://x", "k", "m", client_with(refuse)).ping()
+
+
+async def test_one_retry_on_connect_error_then_success():
+    calls = []
+
+    def handler(req):
+        calls.append(1)
+        if len(calls) == 1:
+            raise httpx.ConnectError("stale endpoint")
+        return httpx.Response(200, json={"reply": "ok"})
+
+    a = MockAdapter("http://m", client_with(handler))
+    assert await a.complete([]) == "ok" and len(calls) == 2
+
+
+async def test_no_retry_on_timeout():
+    calls = []
+
+    def handler(req):
+        calls.append(1)
+        raise httpx.ReadTimeout("slow")
+
+    with pytest.raises(UpstreamTimeout):
+        await MockAdapter("http://m", client_with(handler)).complete([])
+    assert len(calls) == 1
+
+
+async def test_empty_exception_text_falls_back():
+    def handler(req):
+        raise httpx.ConnectTimeout("")
+
+    a = MockAdapter("http://m", client_with(handler))
+    assert not await a.ping() and a.last_error.endswith("timed out")
+
+
+async def test_anthropic_error_message_kept_for_logs_and_empty_reply_rejected():
+    err = httpx.Response(
+        401, json={"error": {"type": "authentication_error", "message": "invalid x-api-key"}}
+    )
+    a = AnthropicAdapter("https://x", "k", "m", client_with(lambda r: err))
+    with pytest.raises(UpstreamUnavailable, match="invalid x-api-key"):
+        await a.complete([{"role": "user", "content": "hi"}])
+    empty = httpx.Response(200, json={"content": [], "stop_reason": "end_turn"})
+    b = AnthropicAdapter("https://x", "k", "m", client_with(lambda r: empty))
+    with pytest.raises(UpstreamUnavailable, match="empty completion"):
+        await b.complete([{"role": "user", "content": "hi"}])

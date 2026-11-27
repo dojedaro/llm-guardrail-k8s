@@ -96,6 +96,46 @@ def test_validation_error():
         assert c.post("/v1/chat", json=bad).status_code == 422
 
 
+def test_invalid_request_is_json_and_does_not_echo_input(capsys):
+    with client() as c:
+        r = c.post("/v1/chat", json={"messages": [{"role": "robot", "content": "jane@example.com"}]})
+    assert r.status_code == 422 and r.json()["error"] == "invalid_request"
+    assert "jane@example.com" not in r.text
+    lines = [json.loads(ln) for ln in capsys.readouterr().out.splitlines() if ln.startswith("{")]
+    assert any(ln.get("decision") == "invalid" and ln["status"] == 422 for ln in lines)
+
+
+def test_oversized_request_rejected():
+    big = {"messages": [{"role": "user", "content": "x" * 20000}] * 6}
+    with client() as c:
+        assert c.post("/v1/chat", json=big).status_code == 422
+
+
+def test_unexpected_error_is_500_json_without_exception_text():
+    class Boom(FakeUpstream):
+        async def complete(self, messages):
+            raise RuntimeError("secret internal detail")
+
+    app = create_app(SETTINGS, Boom(), POLICY)
+    with TestClient(app, raise_server_exceptions=False) as c:
+        r = chat(c, "hi")
+    assert r.status_code == 500 and r.json()["error"] == "internal_error"
+    assert "secret internal detail" not in r.text and r.json()["request_id"] == r.headers["x-request-id"]
+
+
+@pytest.mark.parametrize("bad", ["a b", "x" * 80, "<script>"])
+def test_unsafe_request_id_is_replaced(bad):
+    with client() as c:
+        r = chat(c, "hello", headers={"x-request-id": bad})
+    assert r.json()["request_id"] != bad and len(r.json()["request_id"]) == 16
+
+
+def test_upstream_error_body_has_no_raw_exception_text():
+    with client(FakeUpstream(error=UpstreamUnavailable("ConnectError: http://10.1.2.3 refused"))) as c:
+        r = chat(c, "hi")
+    assert r.status_code == 502 and "10.1.2.3" not in r.text and r.json()["error"] == "upstream_unavailable"
+
+
 def test_health_and_ready():
     with client() as c:
         assert c.get("/healthz").status_code == 200

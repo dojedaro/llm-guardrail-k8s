@@ -1,5 +1,5 @@
 # Mock LLM image. Build context: app/mock-llm
-FROM python:3.12.8-slim-bookworm
+FROM python:3.12.16-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

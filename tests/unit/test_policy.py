@@ -34,3 +34,22 @@ def test_load_from_file(tmp_path):
     f.write_text("version: from-file\npii:\n  mode: block\n")
     p = load_policy(f)
     assert p.version == "from-file" and p.pii_mode == "block"
+
+
+def test_null_sections_use_defaults():
+    p = parse_policy({"version": "v1", "pii": None, "injection": None, "output": None})
+    assert p.pii_mode == "redact" and p.injection_enabled and p.redact_output
+
+
+def test_load_rejects_bad_yaml_as_policy_error(tmp_path):
+    f = tmp_path / "policy.yaml"
+    f.write_text("version: [unclosed\n  pii: {")
+    with pytest.raises(PolicyError, match="not valid YAML"):
+        load_policy(f)
+
+
+def test_load_rejects_wrong_types(tmp_path):
+    f = tmp_path / "policy.yaml"
+    f.write_text("version: v1\ninjection:\n  threshold: lots\n")
+    with pytest.raises(PolicyError, match="wrong type"):
+        load_policy(f)

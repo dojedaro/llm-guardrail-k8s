@@ -27,8 +27,10 @@ class JsonFormatter(logging.Formatter):
 def setup_logging(level: str = "INFO") -> logging.Logger:
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(JsonFormatter())
-    log = logging.getLogger("gateway")
-    log.handlers[:] = [handler]
-    log.setLevel(level.upper())
-    log.propagate = False
-    return log
+    # uvicorn's own loggers too, so every stdout line is JSON (startup, errors, shutdown).
+    for name in ("gateway", "uvicorn", "uvicorn.error"):
+        lg = logging.getLogger(name)
+        lg.handlers[:] = [handler]
+        lg.setLevel(level.upper())
+        lg.propagate = False
+    return logging.getLogger("gateway")

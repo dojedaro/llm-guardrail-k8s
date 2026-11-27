@@ -5,6 +5,7 @@ extend-exclude = [".venv"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP"]
+ignore = ["E501"]  # long regex and message lines are deliberate; `ruff format` handles the rest
 
 [tool.pytest.ini_options]
 pythonpath = ["app/gateway", "app/mock-llm"]

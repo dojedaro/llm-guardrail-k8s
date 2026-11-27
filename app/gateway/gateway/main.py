@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -10,6 +11,8 @@ from typing import Any
 
 import httpx
 from fastapi import FastAPI, Request, Response
+from fastapi.concurrency import run_in_threadpool
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from prometheus_client import (
     CONTENT_TYPE_LATEST,
@@ -18,7 +21,7 @@ from prometheus_client import (
     Histogram,
     generate_latest,
 )
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .config import Settings
 from .guardrails import check_input, check_output
@@ -38,15 +41,27 @@ class Message(BaseModel):
     content: str = Field(max_length=20000)
 
 
+MAX_TOTAL_CHARS = 100_000  # bounds the work one request can cause in the guardrails
+REQUEST_ID = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+
 class ChatRequest(BaseModel):
     messages: list[Message] = Field(min_length=1, max_length=50)
+
+    @model_validator(mode="after")
+    def _bounded(self) -> ChatRequest:
+        if sum(len(m.content) for m in self.messages) > MAX_TOTAL_CHARS:
+            raise ValueError(f"total message length exceeds {MAX_TOTAL_CHARS} characters")
+        return self
 
 
 def build_upstream(s: Settings, client: httpx.AsyncClient) -> Upstream:
     if s.upstream_kind == "anthropic":
         if not s.anthropic_api_key:
             raise RuntimeError("UPSTREAM_KIND=anthropic but ANTHROPIC_API_KEY is empty")
-        return AnthropicAdapter(s.upstream_url, s.anthropic_api_key, s.upstream_model, client)
+        return AnthropicAdapter(
+            s.upstream_url, s.anthropic_api_key, s.upstream_model, client, max_tokens=s.max_tokens
+        )
     return MockAdapter(s.upstream_url, client)
 
 
@@ -65,6 +80,12 @@ class Metrics:
         self.upstream_latency = Histogram(
             "gateway_upstream_latency_seconds", "Upstream call latency", registry=self.registry
         )
+
+
+def _request_id(request: Request) -> str:
+    """Client-supplied X-Request-ID if it is short and boring, else a fresh one (it ends up in logs and headers)."""
+    given = request.headers.get("x-request-id", "")
+    return given if REQUEST_ID.match(given) else uuid.uuid4().hex[:16]
 
 
 def _reply(rid: str, policy_version: str, status: int, body: dict[str, Any]) -> JSONResponse:
@@ -107,6 +128,22 @@ def create_app(
 
     app = FastAPI(title="llm-guardrail-gateway", lifespan=lifespan)
 
+    @app.exception_handler(RequestValidationError)
+    async def invalid_request(request: Request, exc: RequestValidationError) -> JSONResponse:
+        rid = _request_id(request)
+        # Only locations and messages: pydantic's default body would echo the (possibly sensitive) input.
+        problems = [{"loc": list(e["loc"]), "msg": e["msg"]} for e in exc.errors()]
+        log.info(
+            "request", extra={"request_id": rid, "decision": "invalid", "status": 422, "problems": problems}
+        )
+        return _reply(rid, "-", 422, {"request_id": rid, "error": "invalid_request", "problems": problems})
+
+    @app.exception_handler(Exception)
+    async def unexpected(request: Request, exc: Exception) -> JSONResponse:
+        rid = _request_id(request)
+        log.error("request", exc_info=exc, extra={"request_id": rid, "decision": "error", "status": 500})
+        return _reply(rid, "-", 500, {"request_id": rid, "error": "internal_error"})
+
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
         return {"status": "ok"}  # liveness: process is up; deliberately checks nothing else
@@ -116,6 +153,7 @@ def create_app(
         pol: Policy | None = request.app.state.policy
         up_ok = await request.app.state.upstream.ping()
         body = {
+            "version": s.version,
             "policy_loaded": pol is not None,
             "upstream_reachable": up_ok,
             "policy_version": pol.version if pol else None,
@@ -138,13 +176,14 @@ def create_app(
 
     @app.post("/v1/chat")
     async def chat(req: ChatRequest, request: Request) -> JSONResponse:
-        rid = request.headers.get("x-request-id") or uuid.uuid4().hex[:16]
+        rid = _request_id(request)
         pol: Policy | None = request.app.state.policy
         if pol is None:
             return _reply(rid, "-", 503, {"request_id": rid, "error": "policy_not_loaded"})
         base: dict[str, Any] = {"request_id": rid, "policy_version": pol.version}
 
-        res = check_input([m.model_dump() for m in req.messages], pol)
+        # Regex work is CPU-bound: keep it off the event loop so /healthz stays responsive.
+        res = await run_in_threadpool(check_input, [m.model_dump() for m in req.messages], pol)
         for rule, n in res.hits.items():
             metrics.rule_hits.labels(rule, "input").inc(n)
         if res.decision == "blocked":
@@ -182,12 +221,13 @@ def create_app(
                     "status": status,
                 },
             )
-            body = {**base, "error": f"upstream_{kind}", "detail": str(exc)[:200]}
+            # The raw exception text stays in the log; the caller gets only the class of failure.
+            body = {**base, "error": f"upstream_{kind}"}
             return _reply(rid, pol.version, status, body)
         elapsed = time.perf_counter() - t0
         metrics.upstream_latency.observe(elapsed)
 
-        text, out_hits = check_output(text, pol)
+        text, out_hits = await run_in_threadpool(check_output, text, pol)
         for rule, n in out_hits.items():
             metrics.rule_hits.labels(rule, "output").inc(n)
         decision = "redacted" if (res.decision == "redacted" or out_hits) else "allow"

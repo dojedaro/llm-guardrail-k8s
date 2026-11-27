@@ -15,6 +15,8 @@ class Settings:
     anthropic_api_key: str
     policy_path: str
     log_level: str
+    max_tokens: int = 1024
+    version: str = "dev"
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -28,4 +30,6 @@ class Settings:
             anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", ""),
             policy_path=os.getenv("POLICY_PATH", "/etc/guardrail/policy.yaml"),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
+            max_tokens=int(os.getenv("UPSTREAM_MAX_TOKENS", "1024")),
+            version=os.getenv("GATEWAY_VERSION", "dev"),
         )
