@@ -1,5 +1,5 @@
 # Gateway image. Build context: app/gateway
-FROM python:3.12.16-slim-bookworm
+FROM python:3.15.1-slim-bookworm
 
 # No .pyc writes and unbuffered logs: required for readOnlyRootFilesystem and `kubectl logs`.
 ENV PYTHONDONTWRITEBYTECODE=1 \
