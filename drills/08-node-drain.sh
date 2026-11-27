@@ -44,7 +44,7 @@ PROBE_PID=""
 code="$(curl -s -o "$DEVNULL" -w '%{http_code}' -m 3 -H 'Host: guardrail.localtest.me' -H 'content-type: application/json' -d '{}' http://127.0.0.1:8080/v1/chat || true)"
 if [[ "$code" == 422 ]]; then   # 422 = the gateway answered (empty body is invalid); 404 would be the ingress default backend
   log "request loop through the ingress (20 req/s) started in the background"
-  python "$REPO_ROOT/scripts/availability_probe.py" --url http://127.0.0.1:8080 --host guardrail.localtest.me \
+  "$PYTHON" "$REPO_ROOT/scripts/availability_probe.py" --url http://127.0.0.1:8080 --host guardrail.localtest.me \
     --seconds 150 --rate 20 > "$LOG/drill-08-probe.out" 2>&1 &
   PROBE_PID=$!
 else

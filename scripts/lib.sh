@@ -14,6 +14,9 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # so use the mixed form C:/... there. No-op on Linux/macOS.
 if command -v cygpath >/dev/null 2>&1; then REPO_ROOT="$(cygpath -m "$REPO_ROOT")"; fi
 export CHART="$REPO_ROOT/charts/llm-guardrail"
+# Host Python for small JSON helpers: "python" on Windows/macOS venvs, "python3" on stock Ubuntu/Debian.
+PYTHON="$(command -v python || command -v python3 || true)"
+export PYTHON
 
 # Defaults, override with environment variables.
 CLUSTER_NAME="${CLUSTER_NAME:-guardrail}"

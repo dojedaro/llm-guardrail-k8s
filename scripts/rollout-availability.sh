@@ -6,7 +6,8 @@
 #   scripts/rollout-availability.sh            # about 2.5 minutes; DURATION=200 to make it longer
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
-need helm docker kubectl curl python
+need helm docker kubectl curl
+[[ -n "$PYTHON" ]] || die "python3 (or python) is required"
 
 DURATION="${DURATION:-150}"; RATE="${RATE:-20}"
 NEW_TAG="${NEW_IMAGE_TAG:-0.1.1}"
@@ -27,7 +28,7 @@ kind load docker-image --name "$CLUSTER_NAME" "llm-guardrail/gateway:$NEW_TAG" >
 up() { helm upgrade "$RELEASE" "$CHART" -n "$NS" -f "$WORK/base.yaml" --wait --timeout 240s "$@" >/dev/null; }
 
 log "request loop: ${RATE}/s for ${DURATION}s through the ingress"
-python "$REPO_ROOT/scripts/availability_probe.py" --url "$URL" --host guardrail.localtest.me \
+"$PYTHON" "$REPO_ROOT/scripts/availability_probe.py" --url "$URL" --host guardrail.localtest.me \
   --seconds "$DURATION" --rate "$RATE" > "$WORK/probe.out" 2>&1 &
 PROBE=$!
 sleep 8

@@ -7,18 +7,18 @@ source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 MOCK="deploy/$RELEASE-mock-llm"
 
 managers() {  # who owns what on the Deployment, with the index needed to remove an entry
-  kubectl -n "$NS" get "$MOCK" --show-managed-fields -o json | python -c "
+  kubectl -n "$NS" get "$MOCK" --show-managed-fields -o json | "$PYTHON" -c "
 import json, sys
-for i, m in enumerate(json.load(sys.stdin)['metadata']['managedFields']):
+for i, m in enumerate(json.load(sys.stdin)['metadata'].get('managedFields', [])):
     print(f'  [{i}] manager={m[\"manager\"]:<24} operation={m[\"operation\"]:<7} time={m[\"time\"]}')"
 }
 
 if [[ "${1:-inject}" == "restore" ]]; then
   # 1. Remove a leftover kubectl-set entry (needed when it co-owns a field with Helm; --force-conflicts alone
   #    does not remove a manager whose value equals Helm's). 2. Re-assert the chart as owner, 3. roll back.
-  idx="$(kubectl -n "$NS" get "$MOCK" --show-managed-fields -o json | python -c "
+  idx="$(kubectl -n "$NS" get "$MOCK" --show-managed-fields -o json | "$PYTHON" -c "
 import json, sys
-print(next((i for i, m in enumerate(json.load(sys.stdin)['metadata']['managedFields']) if m['manager'] == 'kubectl-set'), ''))")"
+print(next((i for i, m in enumerate(json.load(sys.stdin)['metadata'].get('managedFields', [])) if m['manager'] == 'kubectl-set'), ''))")"
   if [[ -n "$idx" ]]; then
     log "removing the stale 'kubectl-set' field manager (managedFields[$idx])"
     kubectl -n "$NS" patch "$MOCK" --type=json -p "[{\"op\":\"remove\",\"path\":\"/metadata/managedFields/$idx\"}]"

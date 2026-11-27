@@ -117,6 +117,8 @@ fi
 pods="$(kubectl -n kube-system get pods --no-headers 2>/dev/null | awk '{print $1}')"
 if   grep -qiE 'calico|cilium|antrea|weave' <<<"$pods"; then
   emit PASS "networkpolicy support" "CNI known to enforce NetworkPolicy: $(grep -oiE 'calico|cilium|antrea|weave' <<<"$pods" | head -1) (PROBE_NETPOL=1 proves it)"
+elif kubectl version 2>/dev/null | grep -q '+k3s'; then
+  emit PASS "networkpolicy support" "k3s: embedded network policy controller (kube-router) enforces it (PROBE_NETPOL=1 proves it)"
 elif grep -qi 'kindnet' <<<"$pods"; then
   emit WARN "networkpolicy support" "kindnet: enforcement depends on its version; prove it with PROBE_NETPOL=1 or drills/06-networkpolicy-enforcement.sh"
 else
@@ -124,8 +126,9 @@ else
 fi
 
 # 9b. Active probe. A server pod serves a file; a client must fetch it BEFORE deny-all (positive control: proves the
-#     path works and the images pulled) and must then TIME OUT after deny-all. Any other failure is "inconclusive",
-#     never a pass.
+#     path works and the images pulled) and must then be BLOCKED after deny-all: a timeout (dropped, e.g. Calico)
+#     or "connection refused" (rejected, e.g. k3s/kube-router). Refused counts only because the same server answered
+#     the control seconds earlier. Any other failure is "inconclusive", never a pass.
 if [[ "${PROBE_NETPOL:-0}" == "1" ]]; then
   img="${PROBE_IMAGE:-busybox:1.36.1}"; pns=np-probe
   kubectl delete ns "$pns" --ignore-not-found --wait=true >/dev/null 2>&1
@@ -164,10 +167,12 @@ YAML
         after="$(probe ctl-after-$attempt)"
         if grep -q 'probe-ok' <<<"$after"; then verdict=flowed; sleep 3
         elif grep -qi 'timed out' <<<"$after"; then verdict=timeout; break
+        elif grep -qi 'refused' <<<"$after"; then verdict=refused; break
         else verdict="other: $(tail -2 <<<"$after" | tr '\n' ' ')"; break; fi
       done
       case "$verdict" in
-        timeout) emit PASS "networkpolicy enforcement" "active probe: fetch worked before deny-all (control) and TIMED OUT after it" ;;
+        timeout) emit PASS "networkpolicy enforcement" "active probe: fetch worked before deny-all (control) and TIMED OUT after it (dropped)" ;;
+        refused) emit PASS "networkpolicy enforcement" "active probe: fetch worked before deny-all (control) and was REFUSED after it (rejected)" ;;
         flowed)  emit FAIL "networkpolicy enforcement" "active probe: traffic still flowed after deny-all (policies are NOT enforced)" ;;
         *)       emit WARN "networkpolicy enforcement" "probe inconclusive after deny-all: $verdict" ;;
       esac
