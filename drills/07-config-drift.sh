@@ -3,6 +3,7 @@
 # `helm upgrade` fails with a field-ownership conflict. Shows how to find who changed what (managedFields)
 # and how to hand ownership back to Helm. Written up as a customer incident report in 07-config-drift.md.
 set -euo pipefail
+# shellcheck source=_common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 MOCK="deploy/$RELEASE-mock-llm"
 

@@ -30,25 +30,57 @@ die()  { printf '\033[1;31mERROR\033[0m %s\n' "$*" >&2; exit 1; }
 
 need() {  # need kubectl helm ... : fail early with a clear message if a tool is missing
   local c
-  for c in "$@"; do command -v "$c" >/dev/null 2>&1 || die "'$c' not found on PATH (see docs/LAB.md, step 0)"; done
+  for c in "$@"; do command -v "$c" >/dev/null 2>&1 || die "'$c' not found on PATH (see the README, Run it)"; done
 }
 
 gateway_svc() { echo "$RELEASE-gateway"; }
 
+# load_images IMAGE... : make locally built images available to the cluster's nodes without a registry.
+#   IMAGE_LOADER=kind  kind load docker-image (the default when a kind cluster named $CLUSTER_NAME exists)
+#   IMAGE_LOADER=k3s   docker save | k3s ctr images import (needs root; K3S_CMD overrides the "k3s" command)
+#   IMAGE_LOADER=none  build only: push the images to a registry the nodes can pull from (global.imageRegistry)
+load_images() {
+  local loader="${IMAGE_LOADER:-auto}"
+  if [[ "$loader" == auto ]]; then
+    if command -v kind >/dev/null 2>&1 && kind get clusters 2>/dev/null | grep -qx "$CLUSTER_NAME"; then loader=kind
+    elif command -v k3s >/dev/null 2>&1; then loader=k3s
+    else loader=none; fi
+  fi
+  case "$loader" in
+    kind) log "loading images into kind cluster '$CLUSTER_NAME'"; kind load docker-image --name "$CLUSTER_NAME" "$@" ;;
+    k3s)  log "importing images into k3s containerd"
+          # K3S_CMD may hold several words (for example "sudo k3s"), so it must word-split.
+          # shellcheck disable=SC2086
+          docker save "$@" | ${K3S_CMD:-k3s} ctr images import - ;;
+    none) warn "images built but not loaded (IMAGE_LOADER=none): push them to a registry the nodes can pull from" ;;
+    *)    die "unknown IMAGE_LOADER '$loader' (use kind, k3s or none)" ;;
+  esac
+}
+
 # run_pod NAME NAMESPACE LABELS IMAGE PYCODE
 # Runs a one-shot pod executing `python -c PYCODE`, waits for it to finish and prints its logs (also kept in
-# $RUN_POD_LOG). Returns 0 if the container exited 0. Used to test connectivity from inside the cluster.
+# $RUN_POD_LOG). Returns 0 if the container exited 0. Used to test connectivity from inside the cluster. The pod has a
+# security context that satisfies the "restricted" Pod Security Standard, so it is admitted in namespaces that enforce it.
 RUN_POD_LOG=""
 run_pod() {
-  local name="$1" ns="$2" labels="$3" image="$4" code="$5" phase
+  local name="$1" ns="$2" labels="$3" image="$4" code="$5" phase spec
+  spec="$("$PYTHON" -c 'import json, sys
+name, image, code = sys.argv[1:4]
+print(json.dumps({"spec": {
+    "securityContext": {"runAsNonRoot": True, "runAsUser": 10001, "seccompProfile": {"type": "RuntimeDefault"}},
+    "containers": [{"name": name, "image": image, "imagePullPolicy": "IfNotPresent", "command": ["python", "-c", code],
+                    "securityContext": {"allowPrivilegeEscalation": False, "readOnlyRootFilesystem": True,
+                                        "capabilities": {"drop": ["ALL"]}}}]}}))' "$name" "$image" "$code")"
   kubectl -n "$ns" delete pod "$name" --ignore-not-found --wait=true >/dev/null
-  kubectl -n "$ns" run "$name" --image="$image" --image-pull-policy=IfNotPresent --restart=Never     ${labels:+--labels="$labels"} --command -- python -c "$code" >/dev/null
+  kubectl -n "$ns" run "$name" --image="$image" --restart=Never ${labels:+--labels="$labels"} --overrides="$spec" >/dev/null
   for _ in $(seq 1 90); do
     phase="$(kubectl -n "$ns" get pod "$name" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
     [[ "$phase" == "Succeeded" || "$phase" == "Failed" ]] && break
     sleep 1
   done
   RUN_POD_LOG="$(kubectl -n "$ns" logs "$name" 2>&1 || true)"
+  # Prefixing every line is what sed is for; ${var//} cannot anchor at line starts.
+  # shellcheck disable=SC2001
   sed 's/^/    | /' <<<"$RUN_POD_LOG"
   kubectl -n "$ns" delete pod "$name" --wait=false >/dev/null 2>&1 || true
   [[ "$phase" == "Succeeded" ]]
@@ -69,6 +101,13 @@ last_deployed_revision() {
   helm history "$RELEASE" -n "$NS" -o json | tr '{' '\n' | grep '"status":"deployed"' | grep -o '"revision":[0-9]*' | tail -1 | cut -d: -f2
 }
 
+# helm_user_values FILE : the values the release was installed with, as YAML. Helm prints "null" when there are
+# none, which is not a valid values file, so write {} instead.
+helm_user_values() {
+  helm get values "$RELEASE" -n "$NS" -o yaml > "$1"
+  if grep -qx 'null' "$1"; then echo '{}' > "$1"; fi
+}
+
 # Image the gateway Deployment is currently running (so probes use an image the cluster already has).
 gateway_image() {
   kubectl -n "$NS" get deploy "$(gateway_svc)" -o jsonpath='{.spec.template.spec.containers[0].image}'
@@ -76,16 +115,18 @@ gateway_image() {
 
 # redact: stdin -> stdout, masks anything that looks like a credential. Used by collect-diagnostics.sh.
 # Layers: PEM private keys, Authorization/Bearer values, "<name>: value" pairs whose name ends in a secret-ish
-# word (api_key, password, token, secret ... but not secretName), env lists written as name:/value: pairs (YAML and
-# JSON, which is how `helm get manifest` and `kubectl get -o yaml` print them), then well-known key shapes anywhere.
+# word (api_key, password, token, secret ... but not secretName) with the value on the SAME line, env lists written
+# as name:/value: pairs on two lines (YAML and JSON, which is how `helm get manifest` and `kubectl get -o yaml`
+# print them), credentials inside URLs (scheme://user:password@host), then well-known key shapes anywhere.
 # Uses perl (present in Git Bash, Linux and macOS) because GNU-only sed flags are not portable.
 redact() {
   perl -0777 -pe '
     s/-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\z)/<redacted-private-key>/gs;
-    s/\b(authorization"?\s*[:=]\s*"?)(?:Bearer|Basic|Token)\s+[^\s",]+/$1<redacted>/gi;
-    s/\b([A-Za-z0-9_-]*(?:api[-_]?key|password|passwd|token|secret|authorization)"?\s*[:=]\s*)("[^"]*"|[^\s,}]+)/$1<redacted>/gi;
+    s/\b(authorization"?[ \t]*[:=][ \t]*"?)(?:Bearer|Basic|Token)\s+[^\s",]+/$1<redacted>/gi;
+    s/\b([A-Za-z0-9_-]*(?:api[-_]?key|password|passwd|token|secret|authorization)"?[ \t]*[:=][ \t]*)("[^"]*"|[^\s,}]+)/$1<redacted>/gi;
     s/(name:\s*"?[A-Za-z0-9_-]*(?:api[-_]?key|password|passwd|token|secret|authorization)[A-Za-z0-9_-]*"?\s*\n\s*value:\s*)("[^"]*"|[^\s]+)/$1<redacted>/gi;
     s/("name"\s*:\s*"[^"]*(?:api[-_]?key|password|passwd|token|secret|authorization)[^"]*"\s*,\s*"value"\s*:\s*)"[^"]*"/$1"<redacted>"/gi;
+    s{\b([a-z][a-z0-9+.-]*://)[^/\s:@]*:[^/\s@]+@}{$1<redacted>@}gi;
     s/\bBearer\s+[A-Za-z0-9._~+\/=-]{8,}/Bearer <redacted>/gi;
     s/(?<![A-Za-z0-9])sk-(?:ant-|proj-|svcacct-|admin-)?[A-Za-z0-9_-]{16,}/<redacted>/g;
     s/\bAKIA[0-9A-Z]{16}\b/<redacted>/g;

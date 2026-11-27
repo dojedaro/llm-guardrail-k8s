@@ -4,6 +4,7 @@
 #   wrongkey            Secret exists, key name wrong  -> CreateContainerConfigError: couldn't find key
 # No real API key is used or needed: the pods never start.
 set -euo pipefail
+# shellcheck source=_common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 if [[ "${1:-}" == "restore" ]]; then
   drill_restore

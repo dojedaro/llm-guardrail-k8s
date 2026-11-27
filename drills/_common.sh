@@ -2,6 +2,7 @@
 # Shared by the drills. Each drill script supports:  <drill>.sh [inject|restore]
 #   inject  (default)  record the last DEPLOYED Helm revision and the user values, then break something
 #   restore            helm rollback to the recorded revision
+# shellcheck source=../scripts/lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/../scripts/lib.sh"
 need kubectl helm
 
@@ -9,12 +10,11 @@ REV_FILE="$REPO_ROOT/reports/.drill-revision"
 VALUES_FILE="$REPO_ROOT/reports/.drill-values.yaml"
 
 drill_begin() {  # call before breaking anything, and only AFTER validating the arguments
-  helm status "$RELEASE" -n "$NS" >/dev/null 2>&1 || die "release '$RELEASE' not installed in '$NS' (see docs/LAB.md)"
+  helm status "$RELEASE" -n "$NS" >/dev/null 2>&1 || die "release '$RELEASE' not installed in '$NS' (README, Run it)"
   mkdir -p "$REPO_ROOT/reports"
   [[ -f "$REV_FILE" ]] && die "a drill is already active (revision file exists). Run: $0 restore"
   last_deployed_revision > "$REV_FILE"
-  helm get values "$RELEASE" -n "$NS" -o yaml > "$VALUES_FILE"
-  grep -qx 'null' "$VALUES_FILE" && echo '{}' > "$VALUES_FILE"
+  helm_user_values "$VALUES_FILE"
   log "last deployed (healthy) revision recorded: $(cat "$REV_FILE")"
 }
 

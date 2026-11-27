@@ -6,8 +6,18 @@
 #
 # What is and is not simulated: the bundle-and-registry workflow is real; the network is not physically cut
 # off (the machine running this script still has internet). The evidence that the nodes used the bundle is
-# in the pod image names and the kubelet "Pulled" events printed at the end, not in network isolation.
+# in the pod image names and the registry's access log printed at the end (manifest AND blob requests from the
+# nodes), not in network isolation. Blob requests only appear if the nodes did not already have the image layers:
+# run it on a cluster created with IMAGE_LOADER=none (scripts/cluster-up.sh), or the layers may be there already.
+#
+# Use one delivery path per cluster: images the kubelet pulled from the registry and the same image loaded later with
+# `kind load` collide (ImagePullBackOff, see the troubleshooting table in docs/DEPLOYMENT_GUIDE.md).
+#
+# This script drives kind nodes (it teaches their containerd about the registry through `docker exec`). For another
+# cluster, push the bundle's images to the site's registry and run the helm command at the end by hand
+# (docs/DEPLOYMENT_GUIDE.md, section 5).
 set -euo pipefail
+# shellcheck source=lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 need docker kubectl helm kind sha256sum tar curl
 
@@ -46,10 +56,10 @@ docker network connect kind "$REGISTRY_NAME" 2>/dev/null || true
 log "teaching each kind node's containerd to use the registry over plain HTTP"
 for node in $(kind get nodes --name "$CLUSTER_NAME"); do
   # containerd reads certs.d only when registry.config_path points at it. kind v0.33 / containerd 2.x prints an empty
-  # value in `containerd config dump` and still honours /etc/containerd/certs.d (proven by the Pulled events below), so
+  # value in `containerd config dump` and still honours /etc/containerd/certs.d (proven by the registry log below), so
   # this is a warning, not a gate. On other node images, add config_path via kind's containerdConfigPatches.
   docker exec "$node" sh -c "containerd config dump 2>/dev/null | grep -q \"config_path = '/\"" ||
-    warn "containerd on $node shows no explicit registry config_path; relying on its default (see the Pulled events at the end)"
+    warn "containerd on $node shows no explicit registry config_path; relying on its default (see the registry log at the end)"
   docker exec "$node" mkdir -p "/etc/containerd/certs.d/$CLUSTER_REG"
   printf '[host."http://%s"]'$'\n' "$CLUSTER_REG" |
     docker exec -i "$node" tee "/etc/containerd/certs.d/$CLUSTER_REG/hosts.toml" >/dev/null
@@ -74,6 +84,8 @@ kubectl -n "$NS" get pods -o jsonpath='{range .items[*]}{.metadata.name}{"  "}{.
 log "evidence 2: the registry's own access log shows the nodes fetching the images from it"
 # (Not `crictl rmi` + "Pulled" events: removing the registry-named image also removes a local image with the same
 # ID, because kind-loaded and pushed images are identical bits. That broke a following default install in testing.)
-docker logs "$REGISTRY_NAME" 2>&1 | grep -E '"(GET|HEAD) /v2/llm-guardrail/(gateway|mock-llm)/(manifests|blobs)' | tail -6 ||
-  warn "the registry served no manifest/blob request for our images: the nodes did not use it"
+pulls="$(docker logs "$REGISTRY_NAME" 2>&1 | grep -E '"(GET|HEAD) /v2/llm-guardrail/(gateway|mock-llm)/(manifests|blobs)' | grep -v '"docker/' || true)"
+echo "requests from the nodes (containerd): manifests $(grep -c '/manifests/' <<<"$pulls" || true), blobs $(grep -c '/blobs/' <<<"$pulls" || true)"
+grep '/blobs/' <<<"$pulls" | tail -4 || true
+[[ -n "$pulls" ]] || warn "the registry served no request from the nodes: they did not use it"
 helm test "$RELEASE" -n "$NS" --logs

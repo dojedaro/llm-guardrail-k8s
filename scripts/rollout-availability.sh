@@ -5,6 +5,7 @@
 #
 #   scripts/rollout-availability.sh            # about 2.5 minutes; DURATION=200 to make it longer
 set -euo pipefail
+# shellcheck source=lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 need helm docker kubectl curl
 [[ -n "$PYTHON" ]] || die "python3 (or python) is required"
@@ -17,7 +18,7 @@ HEAD=(-H 'Host: guardrail.localtest.me' -H 'content-type: application/json')
 
 code="$(curl -s -o "$DEVNULL" -w '%{http_code}' -m 3 "${HEAD[@]}" -d '{}' "$URL/v1/chat" || true)"
 [[ "$code" == 422 ]] || die "the ingress does not answer on $URL (got '$code'): install with -f charts/llm-guardrail/values-kind.yaml"
-helm get values "$RELEASE" -n "$NS" -o yaml > "$WORK/base.yaml"; grep -qx 'null' "$WORK/base.yaml" && echo '{}' > "$WORK/base.yaml"
+helm_user_values "$WORK/base.yaml"
 BASE_REV="$(last_deployed_revision)"
 if ! docker image inspect "llm-guardrail/gateway:$NEW_TAG" >/dev/null 2>&1; then
   log "building gateway $NEW_TAG"

@@ -1,5 +1,5 @@
 # 1 control-plane + 2 workers. Sized for a laptop with ~8 GB for Docker.
-# If memory is tight, delete one worker block (the chart still runs; the PDB/anti-affinity demo is less interesting).
+# If memory is tight, delete one worker block (the chart still runs; the topology-spread and PodDisruptionBudget demos are less interesting).
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 nodes:

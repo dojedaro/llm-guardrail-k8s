@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Delete the kind cluster and the local registry container used by airgap-install.sh.
 set -euo pipefail
+# shellcheck source=lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 need kind
 

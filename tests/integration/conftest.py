@@ -13,6 +13,7 @@ import os
 import shutil
 import subprocess
 import time
+from collections.abc import Iterator
 
 import httpx
 import pytest
@@ -39,8 +40,19 @@ def kubectl(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["kubectl", *args], capture_output=True, text=True, timeout=120, check=check)
 
 
+def wait_healthy(url: str, timeout_s: float = 30.0) -> bool:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            if httpx.get(f"{url}/healthz", timeout=1).status_code == 200:
+                return True
+        except httpx.HTTPError:
+            time.sleep(1)
+    return False
+
+
 @contextlib.contextmanager
-def forward(port: int):
+def forward(port: int) -> Iterator[str]:
     """kubectl port-forward to the gateway Service. A forward is bound to ONE pod, so it dies when that pod is
     replaced (rollout, drain): tests that roll the gateway open a fresh one afterwards."""
     proc = subprocess.Popen(
@@ -50,14 +62,7 @@ def forward(port: int):
     )
     url = f"http://127.0.0.1:{port}"
     try:
-        deadline = time.time() + 30
-        while time.time() < deadline:
-            try:
-                if httpx.get(f"{url}/healthz", timeout=1).status_code == 200:
-                    break
-            except httpx.HTTPError:
-                time.sleep(1)
-        else:
+        if not wait_healthy(url):
             skip_or_fail(f"gateway at {url} not reachable")
         yield url
     finally:
@@ -65,37 +70,22 @@ def forward(port: int):
 
 
 @pytest.fixture(scope="session")
-def gateway_url():
+def gateway_url() -> Iterator[str]:
     url = os.getenv("GATEWAY_URL")
-    proc = None
-    if not url:
-        if not shutil.which("kubectl"):
-            skip_or_fail("kubectl not installed and GATEWAY_URL not set")
-        probe = kubectl("-n", NS, "get", "svc", f"{RELEASE}-gateway", check=False)
-        if probe.returncode != 0:
-            skip_or_fail(
-                f"no cluster or release found (svc/{RELEASE}-gateway in {NS}): {probe.stderr.strip()[:120]}"
-            )
-        proc = subprocess.Popen(
-            ["kubectl", "-n", NS, "port-forward", f"svc/{RELEASE}-gateway", f"{LOCAL_PORT}:80"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+    if url:
+        if not wait_healthy(url):
+            skip_or_fail(f"gateway at {url} not reachable")
+        yield url
+        return
+    if not shutil.which("kubectl"):
+        skip_or_fail("kubectl not installed and GATEWAY_URL not set")
+    probe = kubectl("-n", NS, "get", "svc", f"{RELEASE}-gateway", check=False)
+    if probe.returncode != 0:
+        skip_or_fail(
+            f"no cluster or release found (svc/{RELEASE}-gateway in {NS}): {probe.stderr.strip()[:120]}"
         )
-        url = f"http://127.0.0.1:{LOCAL_PORT}"
-    deadline = time.time() + 30
-    while time.time() < deadline:
-        try:
-            if httpx.get(f"{url}/healthz", timeout=1).status_code == 200:
-                break
-        except httpx.HTTPError:
-            time.sleep(1)
-    else:
-        if proc:
-            proc.terminate()
-        skip_or_fail(f"gateway at {url} not reachable")
-    yield url
-    if proc:
-        proc.terminate()
+    with forward(LOCAL_PORT) as forwarded:
+        yield forwarded
 
 
 @pytest.fixture()

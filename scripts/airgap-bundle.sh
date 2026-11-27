@@ -8,6 +8,7 @@
 #   SHA256SUMS              checksums of the files above, verified by airgap-install.sh before anything is loaded
 # Run this on a machine WITH internet, then transfer dist/llm-guardrail-airgap-*.tar.gz.
 set -euo pipefail
+# shellcheck source=lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 need docker helm tar sha256sum
 

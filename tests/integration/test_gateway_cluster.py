@@ -62,6 +62,22 @@ def test_prompt_injection_blocked(client):
     assert r.status_code == 403 and r.json()["reason"] == "prompt_injection"
 
 
+def test_benign_multi_turn_conversation_is_not_blocked(client):
+    turns = [
+        "How do I enable developer mode on Android?",
+        "Tap Build number seven times.",
+        "And how do I turn developer mode off?",
+    ]
+    messages = [{"role": "user", "content": t} for t in turns]
+    r = client.post("/v1/chat", json={"messages": messages})
+    assert r.status_code == 200 and r.json()["decision"] == "allow"
+
+
+def test_oversized_body_is_refused_with_413(client):
+    r = client.post("/v1/chat", content=b"x" * ((1 << 20) + 1), headers={"content-type": "application/json"})
+    assert r.status_code == 413 and r.json()["error"] == "request_too_large"
+
+
 def test_request_id_appears_in_pod_logs_without_pii(client):
     rid = "it-" + uuid.uuid4().hex[:10]
     chat(client, "my mail is audit.me@example.com", **{"x-request-id": rid})
@@ -101,7 +117,8 @@ def test_upstream_failure_codes(fault, status, tmp_path):
     history = json.loads(helm("history", RELEASE, "-n", NS, "-o", "json"))
     healthy = str(next(h["revision"] for h in reversed(history) if h["status"] == "deployed"))
     values = tmp_path / "base.yaml"
-    values.write_text(helm("get", "values", RELEASE, "-n", NS, "-o", "yaml").replace("null", "{}"))
+    current = helm("get", "values", RELEASE, "-n", NS, "-o", "yaml")
+    values.write_text("{}" if current.strip() == "null" else current)  # Helm prints null for "no user values"
     try:
         # Explicit baseline values, not --reuse-values (which would also freeze old chart defaults).
         helm("upgrade", RELEASE, CHART, "-n", NS, "-f", str(values), *fault, "--wait", "--timeout", "180s")

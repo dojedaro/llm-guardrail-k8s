@@ -5,6 +5,7 @@
 #
 #   scripts/collect-diagnostics.sh        -> diagnostics-<timestamp>.tar.gz in the repo root
 set -uo pipefail   # no -e: one failing collector must not stop the rest
+# shellcheck source=lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 need kubectl tar
 

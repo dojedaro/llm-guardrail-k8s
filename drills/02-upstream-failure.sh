@@ -4,6 +4,7 @@
 #   502             mock LLM returns HTTP 500 for every call -> gateway answers 502
 #   504             mock LLM is slower than the gateway timeout -> gateway answers 504
 set -euo pipefail
+# shellcheck source=_common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 [[ "${1:-}" == "restore" ]] && { drill_restore; exit 0; }
 MODE="${1:-url}"

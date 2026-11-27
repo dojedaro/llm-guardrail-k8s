@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Drill 1: upgrade points at an image tag that does not exist -> ImagePullBackOff.
 set -euo pipefail
+# shellcheck source=_common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 [[ "${1:-inject}" == "restore" ]] && { drill_restore; exit 0; }
 

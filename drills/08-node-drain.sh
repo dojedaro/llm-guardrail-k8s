@@ -8,6 +8,7 @@
 # Needs the release installed with the ingress enabled (values-kind.yaml) for the request loop; without it the
 # loop is skipped and only the drain behaviour is shown.   Undo: drills/08-node-drain.sh restore
 set -euo pipefail
+# shellcheck source=_common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 WORKERS=(); while read -r n; do WORKERS+=("$n"); done < <(kubectl get nodes -l '!node-role.kubernetes.io/control-plane' -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
 if [[ "${1:-inject}" == "restore" ]]; then

@@ -10,6 +10,7 @@
 # was listening. A DNS error or an image-pull failure is reported as inconclusive, never as proof.
 # Exit code 0 = enforcement proven.
 set -euo pipefail
+# shellcheck source=_common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 
 IMG="$(gateway_image)"
@@ -25,7 +26,9 @@ except Exception as e:
         print('REFUSED', reason); sys.exit(1)
     print('ERROR', type(e).__name__, e); sys.exit(2)"
 
-kubectl create namespace np-outsider --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+# A namespace left over from an earlier run may still be terminating (the trap below does not wait); creating pods in it fails.
+kubectl delete namespace np-outsider --ignore-not-found --wait=true >/dev/null
+kubectl create namespace np-outsider >/dev/null
 trap 'kubectl delete namespace np-outsider --wait=false >/dev/null 2>&1 || true' EXIT
 
 log "control: allowed client (label guardrail-client=true) in namespace $NS"

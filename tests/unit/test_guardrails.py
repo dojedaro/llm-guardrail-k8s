@@ -131,7 +131,7 @@ def test_output_redaction():
     assert text == "leaked@example.com" and hits == {}
 
 
-# ---- cases found by the independent review and by the evaluation corpus --------------------
+# ---- cases found while reviewing the rules and by the evaluation corpus ---------------
 
 
 @pytest.mark.parametrize(

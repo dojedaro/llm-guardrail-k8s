@@ -14,65 +14,74 @@ a blocked change window, a `failed` revision in the release history, and (in the
 
 ## Impact
 - Customer-facing: none observed. The failed upgrade changed no live object, and the gateway pods were not touched. The hand edit itself rolled the single mock-llm pod; no request loop was running during this drill, so there is no measurement of that moment.
-- Operational: the upgrade could not be applied; `helm history` showed revision 40 as `failed` (capture below); anyone reading `helm list`
+- Operational: the upgrade could not be applied; `helm history` showed revision 6 as `failed` (capture below); anyone reading `helm list`
   would see the release as `failed` even though every pod was healthy.
 
-## Timeline (real run, UTC, from `reports/drill-07-config-drift.log`)
+## Timeline (real run, UTC)
 | Time | Event |
 |---|---|
-| 02:18:33 | Operator runs `kubectl set env deploy/guardrail-mock-llm MOCK_LATENCY_MS=1` ("temporary" change). Deployment rolls; `kubectl-set` becomes owner of that env var. |
-| 02:18:38 | Planned change window: `helm upgrade ... --set policy.version=drift-demo --wait`. Helm 4 applies server-side, the API server reports a conflict, Helm records revision 40 as `failed`. |
-| 02:18:38 | `managedFields` inspected: `helm` (Apply) and `kubectl-set` (Update) both appear, the latter owns the env var. |
-| 02:18:45 | Resolution: ownership handed back with `--force-conflicts`, then rolled back to the last deployed revision (39). |
+| 04:36:30 | Operator runs `kubectl set env deploy/guardrail-mock-llm MOCK_LATENCY_MS=1` ("temporary" change). Deployment rolls; `kubectl-set` becomes owner of that env var. |
+| 04:36:38 | Planned change window: `helm upgrade ... --set policy.version=drift-demo --wait`. Helm 4 applies server-side, the API server reports a conflict, Helm records revision 6 as `failed`. |
+| 04:36:39 | `managedFields` inspected: `helm` (Apply) and `kubectl-set` (Update) both appear, the latter owns the env var. |
+| 04:36:51 | Resolution: ownership handed back with `--force-conflicts`, then rolled back to the last deployed revision (5). |
 
 ## What the customer-visible error looked like
 ```text
-# drill 07, 2026-11-27T02:18:32Z, helm v4.3.2+g8346aaa, kind v0.33.0, k8s v1.37.0
+# drill 07, 2026-11-27T04:36:27Z, helm v4.3.2+g8346aaa, kind v0.33.0, k8s v1.37.0
 $ drills/07-config-drift.sh
-==> last deployed (healthy) revision recorded: 39
+==> last deployed (healthy) revision recorded: 5
 ==> hand edit, outside Helm: kubectl set env deploy/guardrail-mock-llm MOCK_LATENCY_MS=1
 deployment.apps/guardrail-mock-llm env updated
 Waiting for deployment "guardrail-mock-llm" rollout to finish: 1 old replicas are pending termination...
 Waiting for deployment "guardrail-mock-llm" rollout to finish: 1 old replicas are pending termination...
 deployment "guardrail-mock-llm" successfully rolled out
 ==> a routine change window: helm upgrade with a new policy version (expected to FAIL)
-level=WARN msg="upgrade failed" name=guardrail error="conflict occurred while applying object guardrail/guardrail-mock-llm apps/v1, Kind=Deployment: Apply failed with 1 conflict: conflict with \"kubectl-set\" using apps/v1: .spec.template.spec.containers[name=\"mock-llm\"].env[name=\"MOCK_LATENCY_MS\"].value"
 Error: UPGRADE FAILED: conflict occurred while applying object guardrail/guardrail-mock-llm apps/v1, Kind=Deployment: Apply failed with 1 conflict: conflict with "kubectl-set" using apps/v1: .spec.template.spec.containers[name="mock-llm"].env[name="MOCK_LATENCY_MS"].value
 ==> release status after the failed upgrade
-38      	Fri Nov 27 11:18:06 2026	superseded	llm-guardrail-0.1.0	0.1.0      	Upgrade complete                                                                                                           
-39      	Fri Nov 27 11:18:11 2026	deployed  	llm-guardrail-0.1.0	0.1.0      	Upgrade complete                                                                                                           
-40      	Fri Nov 27 11:18:38 2026	failed    	llm-guardrail-0.1.0	0.1.0      	Upgrade "guardrail" failed: conflict occurred while applying object guardrail/guardrail-mock-llm apps/v1, Kind=Deployment: 
+4       	Fri Nov 27 13:34:41 2026	superseded	llm-guardrail-0.1.0	0.1.0  Upgrade complete                                                                
+5       	Fri Nov 27 13:35:05 2026	deployed  llm-guardrail-0.1.0	0.1.0      	Rollback to 3                                   
+6       	Fri Nov 27 13:36:38 2026	failed  llm-guardrail-0.1.0	0.1.0      	Upgrade "guardrail" failed: conflict occurred wh
 ==> who owns the conflicting field? (managedFields)
-  [0] manager=helm                     operation=Apply   time=2026-11-27T02:18:12Z
-  [1] manager=kubectl-set              operation=Update  time=2026-11-27T02:18:33Z
-  [2] manager=kube-controller-manager  operation=Update  time=2026-11-27T02:18:38Z
+  [0] manager=helm                     operation=Apply   time=2026-11-27T04:35:05Z
+  [1] manager=kubectl-set              operation=Update  time=2026-11-27T04:36:30Z
+  [2] manager=kube-controller-manager  operation=Update  time=2026-11-27T04:36:39Z
 
 ==> FAULT INJECTED: mock-llm env edited by kubectl; helm upgrade blocked
     Now diagnose it. Writeup: drills/07-config-drift.md
     Undo with: drills/07-config-drift.sh restore
+exit code: 0
 $ kubectl describe/get: who changed it
 MOCK_LATENCY_MS=1
 MOCK_ERROR_RATE=0
 $ helm get values (what Helm believes)
+mockLlm:
+  enabled: true
   faults:
     errorRate: 0
     latencyMs: 0
   image:
 $ drills/07-config-drift.sh restore
+==> removing the stale 'kubectl-set' field manager (managedFields[1])
+deployment.apps/guardrail-mock-llm patched
+==> rolling back to revision 5
 Rollback was a success! Happy Helming!
-NAME                                  READY   STATUS        RESTARTS   AGE
-guardrail-gateway-55d4f6c6db-d5fz8    1/1     Running       0          67s
-guardrail-gateway-55d4f6c6db-pfw7n    1/1     Running       0          71s
-guardrail-gateway-685db44f96-hvwfd    0/1     Terminating   0          7s
-guardrail-mock-llm-75598fd896-4zst2   1/1     Running       0          5s
-guardrail-mock-llm-78657c4b49-rwl4c   0/1     Completed     0          12s
-guardrail-smoke-test                  0/1     Completed     0          12m
+NAME                                  READY   STATUS      RESTARTS   AGE
+guardrail-gateway-646c646f9f-9prw6    1/1     Running     0          101s
+guardrail-gateway-646c646f9f-nstnc    1/1     Running     0          108s
+guardrail-mock-llm-75598fd896-6pp7j   1/1     Running     0          11s
+guardrail-mock-llm-78657c4b49-rbjzt   0/1     Completed   0          23s
+guardrail-smoke-test                  0/1     Completed   0          3m4s
+exit code: 0
 $ helm status after restore
 NAME: guardrail
-LAST DEPLOYED: Fri Nov 27 11:18:45 2026
+LAST DEPLOYED: Fri Nov 27 13:36:51 2026
 NAMESPACE: guardrail
 STATUS: deployed
-REVISION: 42
+REVISION: 8
+DESCRIPTION: Rollback to 5
+$ managedFields after restore
+  [0] manager=helm                     operation=Apply
+  [1] manager=kube-controller-manager  operation=Update
 ```
 
 ## Diagnosis
@@ -91,7 +100,7 @@ Helm 4 applies manifests with **server-side apply** by default. Every field has 
 (client-side three-way merge) would usually have overwritten the hand edit silently, which hides the drift instead of surfacing it.
 
 ## Resolution, and two things that did not work the way we expected
-All three were checked live (`reports/drill-07-experiments.log`, same versions, same day):
+All three were checked live on the same cluster, with the same versions, on the same day:
 
 1. **`helm upgrade --force-conflicts` works when Helm's value differs from the hand edit.** Helm wants `0`, the live value is `1`: forcing
    takes the field over, and afterwards only `helm` owns it. This is what `drills/07-config-drift.sh restore` does. Decide first which value is

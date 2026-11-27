@@ -11,8 +11,11 @@ So the claim is tested, not assumed.
 1. **Control**: a pod in the release namespace with label `guardrail-client=true` calls the gateway. It must succeed
    (this proves the cluster, DNS and the gateway are healthy, so a failure below is meaningful).
 2. **Outsider**: a pod in another namespace (`np-outsider`, which has no default-deny of its own) calls the same gateway.
-   Only the gateway's ingress policy can stop it, and it must **time out**. A DNS error, a refused connection or an
-   image-pull failure is reported as *inconclusive*, never as proof.
+   Only the gateway's ingress policy can stop it. Enforcers block in one of two ways, and both count: **dropped** (the client
+   times out: Calico, Cilium) or **rejected** (the client gets "connection refused": k3s's embedded kube-router answers with
+   `-j REJECT --reject-with icmp-port-unreachable`). A refusal is accepted only because the control pod reached the *same* Service
+   in the same run, so the gateway was listening. A DNS error or an image-pull failure is reported as *inconclusive*, never as proof.
+   Both pods run with a restricted security context, so the drill also works in a namespace that enforces the `restricted` Pod Security profile.
 
 Exit code 0 means enforcement is proven.
 
@@ -20,7 +23,7 @@ Exit code 0 means enforcement is proven.
 Captured from a real run on the local kind cluster (header line of the log gives the date and versions). Nothing below is edited except where marked trimmed.
 
 ```text
-# drill 06, 2026-11-27T02:16:40Z, kind v0.33.0, k8s v1.37.0, Calico v3.28.2
+# drill 06, 2026-11-27T04:36:06Z, kind v0.33.0, k8s v1.37.0, Calico v3.28.2
 $ drills/06-networkpolicy-enforcement.sh
 ==> control: allowed client (label guardrail-client=true) in namespace guardrail
     | CONNECTED 200
@@ -28,8 +31,8 @@ $ drills/06-networkpolicy-enforcement.sh
     | TIMEOUT TimeoutError
 
 control  -> ok   (expected: ok)
-outsider -> blocked  (expected: blocked, meaning a connection timeout)
-==> PASS: NetworkPolicy is enforced by this cluster's CNI
+outsider -> blocked (dropped: timeout)  (expected: blocked)
+==> PASS: NetworkPolicy is enforced by this cluster: traffic dropped: timeout while the control got through
 exit code: 0
 $ kubectl describe networkpolicy guardrail-gateway-ingress
 Spec:
@@ -51,14 +54,14 @@ calico-node-d6ps7                                 1/1     Running   0          4
 ## Interpreting the result
 | control | outsider | Meaning |
 |---|---|---|
-| ok | blocked (timeout) | Enforced. |
+| ok | blocked (timeout, or refused) | Enforced: dropped or rejected, depending on the CNI. |
 | ok | connected | Not enforced: the CNI ignores policies. Recreate with `CNI=calico scripts/cluster-up.sh` and re-run. |
 | ok | inconclusive | The outsider failed for another reason (see its log); fix that and re-run. |
 | fail | any | Test is invalid: fix the release first (`helm test`, `kubectl get pods`). |
 
 ## Prevention
 - Make the enforcement test part of every environment assessment for a new cluster (`PROBE_NETPOL=1 scripts/preflight.sh` is a generic
-  version with a positive control and the same timeout-only rule).
+  version with a positive control and the same timeout-or-refused rule).
 - State which CNI was verified in the deployment report.
 
 ## Note on kind

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Drill 4: memory limit far too low -> container is OOMKilled -> CrashLoopBackOff.
 set -euo pipefail
+# shellcheck source=_common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 [[ "${1:-inject}" == "restore" ]] && { drill_restore; exit 0; }
 

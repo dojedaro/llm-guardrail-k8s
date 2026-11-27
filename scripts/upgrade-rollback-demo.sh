@@ -3,12 +3,13 @@
 #   A. config change : flip policy.pii.mode (redact <-> block), verify, helm history, rollback, verify
 #   B. image upgrade : gateway 0.1.0 -> 0.1.1 (a real rebuild, reported by /readyz), verify, rollback, verify
 # If a verification fails after an upgrade, the script rolls the release back itself before exiting non-zero.
-# Requires the release to be installed already (see docs/LAB.md). Safe to re-run.
+# Requires the release to be installed already (README, Run it). Safe to re-run.
 #
 # Values handling: the baseline's user-supplied values are saved to a file and passed back with -f on every
 # upgrade. `--reuse-values` is avoided on purpose: it also freezes chart DEFAULTS from the old release, so new
 # defaults in a newer chart version silently do not apply.
 set -euo pipefail
+# shellcheck source=lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 need kubectl helm curl docker
 
@@ -47,8 +48,7 @@ verify() { # verify <expected-gateway-version> <expected-pii-mode>
 restart_pf() { pf_stop; sleep 1; pf_start "$PORT"; }   # a port-forward targets ONE pod; restart after rollouts
 upgrade() { helm upgrade "$RELEASE" "$CHART" -n "$NS" -f "$WORK/base-values.yaml" --hide-notes "$AUTOROLLBACK" --wait --timeout 240s "$@"; }
 
-helm get values "$RELEASE" -n "$NS" -o yaml > "$WORK/base-values.yaml"
-grep -qx 'null' "$WORK/base-values.yaml" && echo '{}' > "$WORK/base-values.yaml"
+helm_user_values "$WORK/base-values.yaml"
 BASE_REV="$(last_deployed_revision)"
 BASE_MODE="$(helm get values "$RELEASE" -n "$NS" -a -o yaml | awk '/^policy:/{p=1} p && /^  pii:/{q=1} q && /mode:/{print $2; exit}')"
 BASE_TAG="$(helm get values "$RELEASE" -n "$NS" -a -o yaml | awk '/^gateway:/{g=1} g && /^  image:/{i=1} i && /tag:/{gsub(/"/,"",$2); print $2; exit}')"
@@ -66,9 +66,9 @@ log "A. rollback to revision $BASE_REV"
 helm rollback "$RELEASE" "$BASE_REV" -n "$NS" --wait --timeout 180s
 PENDING=""; restart_pf; verify "$BASE_TAG" "$BASE_MODE"
 
-log "B. image upgrade: build gateway $NEW_IMAGE_TAG and load it into kind"
+log "B. image upgrade: build gateway $NEW_IMAGE_TAG and load it into the cluster"
 docker build -q --build-arg "GATEWAY_VERSION=$NEW_IMAGE_TAG" -t "llm-guardrail/gateway:$NEW_IMAGE_TAG" "$REPO_ROOT/app/gateway" >/dev/null
-kind load docker-image --name "$CLUSTER_NAME" "llm-guardrail/gateway:$NEW_IMAGE_TAG"
+load_images "llm-guardrail/gateway:$NEW_IMAGE_TAG"
 PENDING="$(last_deployed_revision)"
 upgrade --set "gateway.image.tag=$NEW_IMAGE_TAG"
 restart_pf; verify "$NEW_IMAGE_TAG" "$BASE_MODE"
