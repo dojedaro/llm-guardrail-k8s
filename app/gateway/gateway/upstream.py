@@ -23,6 +23,8 @@ class Upstream(Protocol):
 
     async def ping(self) -> bool: ...
 
+    last_error: str | None
+
 
 async def _post(client: httpx.AsyncClient, url: str, **kw: Any) -> httpx.Response:
     try:
@@ -43,6 +45,7 @@ class MockAdapter:
 
     def __init__(self, url: str, client: httpx.AsyncClient) -> None:
         self.url, self.client = url.rstrip("/"), client
+        self.last_error: str | None = None  # why the last ping failed; logged by /readyz
 
     async def complete(self, messages: list[dict[str, str]]) -> str:
         resp = await _post(self.client, f"{self.url}/v1/chat", json={"messages": messages})
@@ -50,9 +53,11 @@ class MockAdapter:
 
     async def ping(self) -> bool:
         try:
-            return (await self.client.get(f"{self.url}/healthz", timeout=2.0)).status_code == 200
-        except httpx.HTTPError:
-            return False
+            status = (await self.client.get(f"{self.url}/healthz", timeout=2.0)).status_code
+            self.last_error = None if status == 200 else f"HTTP {status}"
+        except httpx.HTTPError as exc:
+            self.last_error = f"{type(exc).__name__}: {exc or 'timed out'}"
+        return self.last_error is None
 
 
 class AnthropicAdapter:
@@ -65,6 +70,7 @@ class AnthropicAdapter:
     ) -> None:
         self.url, self.api_key, self.model = url.rstrip("/"), api_key, model
         self.client, self.max_tokens = client, max_tokens
+        self.last_error: str | None = None
 
     async def complete(self, messages: list[dict[str, str]]) -> str:
         system = "\n".join(m["content"] for m in messages if m["role"] == "system")
@@ -86,6 +92,7 @@ class AnthropicAdapter:
         # We do not call the model here, so readiness probes cost no tokens.
         try:
             await self.client.get(self.url, timeout=3.0)
-            return True
-        except httpx.HTTPError:
-            return False
+            self.last_error = None
+        except httpx.HTTPError as exc:
+            self.last_error = f"{type(exc).__name__}: {exc or 'timed out'}"
+        return self.last_error is None

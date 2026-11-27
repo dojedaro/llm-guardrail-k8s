@@ -120,6 +120,16 @@ def create_app(
             "upstream_reachable": up_ok,
             "policy_version": pol.version if pol else None,
         }
+        if not (pol and up_ok):
+            # The reason is what an operator needs at 3am: say it in the log, not only via the probe status.
+            log.warning(
+                "not ready",
+                extra={
+                    **body,
+                    "upstream_url": s.upstream_url,
+                    "upstream_error": getattr(request.app.state.upstream, "last_error", None),
+                },
+            )
         return JSONResponse(body, status_code=200 if pol and up_ok else 503)
 
     @app.get("/metrics")

@@ -24,7 +24,17 @@ async def test_mock_adapter_complete():
 async def test_mock_adapter_ping():
     ok = MockAdapter("http://m", client_with(lambda r: httpx.Response(200, json={})))
     bad = MockAdapter("http://m", client_with(lambda r: httpx.Response(500)))
-    assert await ok.ping() and not await bad.ping()
+    assert await ok.ping() and ok.last_error is None
+    assert not await bad.ping() and bad.last_error == "HTTP 500"
+
+
+async def test_ping_records_dns_failure_reason():
+    def handler(req):
+        raise httpx.ConnectError("[Errno -3] Temporary failure in name resolution")
+
+    a = MockAdapter("http://typo", client_with(handler))
+    assert not await a.ping()
+    assert "name resolution" in a.last_error
 
 
 async def test_timeout_maps_to_upstream_timeout():
