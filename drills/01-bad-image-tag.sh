@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Drill 1: upgrade points at an image tag that does not exist -> ImagePullBackOff.
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
+[[ "${1:-inject}" == "restore" ]] && { drill_restore; exit 0; }
+
+drill_begin
+helm_break --set gateway.image.tag=0.1.0-doesnotexist
+sleep 15
+kubectl -n "$NS" get pods -l app.kubernetes.io/name=gateway
+banner "gateway image tag 0.1.0-doesnotexist" 01-bad-image-tag.md
