@@ -1,4 +1,4 @@
-"""Upstream LLM adapters. Both raise the same two exceptions so the API layer
+"""Upstream LLM adapters. Both raise the same exceptions so the API layer
 can map them to HTTP codes without knowing which provider is configured."""
 
 from __future__ import annotations
@@ -14,6 +14,10 @@ class UpstreamTimeout(Exception):
 
 class UpstreamUnavailable(Exception):
     """Connection refused, DNS failure, or upstream returned an error -> HTTP 502."""
+
+
+class UpstreamRefused(Exception):
+    """The model declined to answer (Anthropic stop_reason "refusal") -> HTTP 502, reported as its own kind."""
 
 
 class Upstream(Protocol):
@@ -81,10 +85,16 @@ class AnthropicAdapter:
     name = "anthropic"
 
     def __init__(
-        self, url: str, api_key: str, model: str, client: httpx.AsyncClient, max_tokens: int = 1024
+        self,
+        url: str,
+        api_key: str,
+        model: str,
+        client: httpx.AsyncClient,
+        max_tokens: int = 4096,
+        effort: str = "low",
     ) -> None:
         self.url, self.api_key, self.model = url.rstrip("/"), api_key, model
-        self.client, self.max_tokens = client, max_tokens
+        self.client, self.max_tokens, self.effort = client, max_tokens, effort
         self.last_error: str | None = None
 
     async def complete(self, messages: list[dict[str, str]]) -> str:
@@ -95,15 +105,24 @@ class AnthropicAdapter:
             "max_tokens": self.max_tokens,
             "messages": convo,
         }
+        if self.effort:
+            # Current Claude models think by default and thinking tokens count against max_tokens;
+            # a low effort keeps a short chat answer from being spent on reasoning.
+            body["output_config"] = {"effort": self.effort}
         if system:
             body["system"] = system
         headers = {"x-api-key": self.api_key, "anthropic-version": "2023-06-01"}
         resp = await _post(self.client, f"{self.url}/v1/messages", json=body, headers=headers)
         data = resp.json()
+        stop = data.get("stop_reason")
+        if stop == "refusal":
+            category = (data.get("stop_details") or {}).get("category")
+            raise UpstreamRefused(f"model refused (category={category})")
         text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
         if not text:
-            raise UpstreamUnavailable(f"empty completion (stop_reason={data.get('stop_reason')})")
-        if data.get("stop_reason") == "max_tokens":
+            hint = " - raise UPSTREAM_MAX_TOKENS: reasoning can use all of it" if stop == "max_tokens" else ""
+            raise UpstreamUnavailable(f"empty completion (stop_reason={stop}){hint}")
+        if stop == "max_tokens":
             text += " [truncated: max_tokens reached]"
         return text
 

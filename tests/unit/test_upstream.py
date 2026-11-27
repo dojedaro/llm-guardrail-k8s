@@ -1,8 +1,11 @@
+import json
+
 import httpx
 import pytest
 from gateway.upstream import (
     AnthropicAdapter,
     MockAdapter,
+    UpstreamRefused,
     UpstreamTimeout,
     UpstreamUnavailable,
 )
@@ -138,3 +141,54 @@ async def test_anthropic_error_message_kept_for_logs_and_empty_reply_rejected():
     b = AnthropicAdapter("https://x", "k", "m", client_with(lambda r: empty))
     with pytest.raises(UpstreamUnavailable, match="empty completion"):
         await b.complete([{"role": "user", "content": "hi"}])
+
+
+async def test_anthropic_refusal_is_its_own_error_with_the_category():
+    refused = httpx.Response(
+        200,
+        json={
+            "content": [],
+            "stop_reason": "refusal",
+            "stop_details": {"type": "refusal", "category": "cyber"},
+        },
+    )
+    a = AnthropicAdapter("https://x", "k", "m", client_with(lambda r: refused))
+    with pytest.raises(UpstreamRefused, match="category=cyber"):
+        await a.complete([{"role": "user", "content": "hi"}])
+
+
+async def test_anthropic_request_carries_effort_and_max_tokens():
+    seen = {}
+
+    def handler(req):
+        seen.update(json.loads(req.content))
+        return httpx.Response(
+            200, json={"content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn"}
+        )
+
+    a = AnthropicAdapter("https://x", "k", "m", client_with(handler), max_tokens=2048, effort="low")
+    assert await a.complete([{"role": "system", "content": "s"}, {"role": "user", "content": "hi"}]) == "ok"
+    assert seen["max_tokens"] == 2048 and seen["output_config"] == {"effort": "low"} and seen["system"] == "s"
+    assert seen["messages"] == [{"role": "user", "content": "hi"}]
+
+
+async def test_anthropic_effort_can_be_left_out():
+    seen = {}
+
+    def handler(req):
+        seen.update(json.loads(req.content))
+        return httpx.Response(
+            200, json={"content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn"}
+        )
+
+    await AnthropicAdapter("https://x", "k", "m", client_with(handler), effort="").complete([])
+    assert "output_config" not in seen
+
+
+async def test_empty_completion_at_max_tokens_points_at_the_limit():
+    empty = httpx.Response(
+        200, json={"content": [{"type": "thinking", "thinking": ""}], "stop_reason": "max_tokens"}
+    )
+    a = AnthropicAdapter("https://x", "k", "m", client_with(lambda r: empty))
+    with pytest.raises(UpstreamUnavailable, match="UPSTREAM_MAX_TOKENS"):
+        await a.complete([{"role": "user", "content": "hi"}])

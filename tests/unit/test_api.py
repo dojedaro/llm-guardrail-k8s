@@ -4,9 +4,9 @@ import logging
 import pytest
 from fastapi.testclient import TestClient
 from gateway.config import Settings
-from gateway.main import build_upstream, create_app
+from gateway.main import MAX_BODY_BYTES, build_upstream, create_app
 from gateway.policy import Policy
-from gateway.upstream import UpstreamTimeout, UpstreamUnavailable
+from gateway.upstream import UpstreamRefused, UpstreamTimeout, UpstreamUnavailable
 
 SETTINGS = Settings("mock", "http://x", "m", 1.0, "", "/nonexistent.yaml", "INFO")
 
@@ -79,13 +79,17 @@ def test_output_redaction():
 
 
 @pytest.mark.parametrize(
-    "err,status",
-    [(UpstreamTimeout("t"), 504), (UpstreamUnavailable("refused"), 502)],
+    "err,status,code",
+    [
+        (UpstreamTimeout("t"), 504, "upstream_timeout"),
+        (UpstreamUnavailable("refused"), 502, "upstream_unavailable"),
+        (UpstreamRefused("model refused"), 502, "upstream_refused"),
+    ],
 )
-def test_upstream_errors(err, status):
+def test_upstream_errors(err, status, code):
     with client(FakeUpstream(error=err)) as c:
         r = chat(c, "hi")
-    assert r.status_code == status
+    assert r.status_code == status and r.json()["error"] == code
     assert r.json()["request_id"] == r.headers["x-request-id"]
 
 
@@ -109,6 +113,36 @@ def test_oversized_request_rejected():
     big = {"messages": [{"role": "user", "content": "x" * 20000}] * 6}
     with client() as c:
         assert c.post("/v1/chat", json=big).status_code == 422
+
+
+def test_body_over_the_limit_is_refused_by_content_length(capsys):
+    up = FakeUpstream()
+    with client(up) as c:
+        r = c.post(
+            "/v1/chat", content=b"x" * (MAX_BODY_BYTES + 1), headers={"content-type": "application/json"}
+        )
+    assert r.status_code == 413 and r.json()["error"] == "request_too_large"
+    assert r.json()["request_id"] == r.headers["x-request-id"] and up.seen is None
+    assert '"status": 413' in capsys.readouterr().out
+
+
+def test_streamed_body_over_the_limit_is_aborted():
+    def chunks():  # no Content-Length: sent chunked, so only counting the bytes can catch it
+        yield b'{"messages": [{"role": "user", "content": "'
+        for _ in range(MAX_BODY_BYTES // 65536 + 2):
+            yield b"x" * 65536
+
+    with client() as c:
+        r = c.post("/v1/chat", content=chunks(), headers={"content-type": "application/json"})
+    assert r.status_code == 413 and r.json()["error"] == "request_too_large"
+
+
+def test_body_just_under_the_limit_is_still_validated_normally():
+    body = '{"messages": [{"role": "user", "content": "' + "x" * 19_000 + '"}]}'
+    with client() as c:
+        assert (
+            c.post("/v1/chat", content=body, headers={"content-type": "application/json"}).status_code == 200
+        )
 
 
 def test_unexpected_error_is_500_json_without_exception_text():

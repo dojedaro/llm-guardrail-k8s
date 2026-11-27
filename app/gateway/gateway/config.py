@@ -15,7 +15,9 @@ class Settings:
     anthropic_api_key: str
     policy_path: str
     log_level: str
-    max_tokens: int = 1024
+    # Anthropic's thinking tokens count against max_tokens, so this leaves room for the answer too.
+    max_tokens: int = 4096
+    effort: str = "low"
     version: str = "dev"
 
     @classmethod
@@ -30,6 +32,7 @@ class Settings:
             anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", ""),
             policy_path=os.getenv("POLICY_PATH", "/etc/guardrail/policy.yaml"),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
-            max_tokens=int(os.getenv("UPSTREAM_MAX_TOKENS", "1024")),
+            max_tokens=int(os.getenv("UPSTREAM_MAX_TOKENS", "4096")),
+            effort=os.getenv("UPSTREAM_EFFORT", "low"),
             version=os.getenv("GATEWAY_VERSION", "dev"),
         )

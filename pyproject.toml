@@ -13,3 +13,8 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 markers = ["integration: needs a running cluster (set GATEWAY_URL or port-forward)"]
+
+[tool.mypy]
+strict = true
+files = ["app/gateway/gateway"]
+plugins = ["pydantic.mypy"]

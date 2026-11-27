@@ -51,5 +51,26 @@ def test_load_rejects_bad_yaml_as_policy_error(tmp_path):
 def test_load_rejects_wrong_types(tmp_path):
     f = tmp_path / "policy.yaml"
     f.write_text("version: v1\ninjection:\n  threshold: lots\n")
-    with pytest.raises(PolicyError, match="wrong type"):
+    with pytest.raises(PolicyError, match="threshold"):
         load_policy(f)
+
+
+@pytest.mark.parametrize("threshold", [0, -1, True, 2.5, "3"])
+def test_threshold_must_be_a_positive_integer(threshold):
+    # 0 would block every request, including an empty greeting.
+    with pytest.raises(PolicyError, match="threshold"):
+        parse_policy({"version": "v1", "injection": {"threshold": threshold}})
+
+
+@pytest.mark.parametrize("rules", [[], "email", ["email", ["phone"]], ["email", "dna"]])
+def test_rules_must_be_a_non_empty_list_of_known_rules(rules):
+    # An empty list used to be read as "all rules"; say so instead of guessing.
+    with pytest.raises(PolicyError, match="rules"):
+        parse_policy({"version": "v1", "pii": {"rules": rules}})
+
+
+def test_rules_keep_a_canonical_order():
+    assert parse_policy({"version": "v1", "pii": {"rules": ["phone", "email"]}}).pii_rules == (
+        "email",
+        "phone",
+    )

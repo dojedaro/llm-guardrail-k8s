@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 import re
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -22,6 +23,8 @@ from prometheus_client import (
     generate_latest,
 )
 from pydantic import BaseModel, Field, model_validator
+from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.types import Message as AsgiMessage
 
 from .config import Settings
 from .guardrails import check_input, check_output
@@ -31,18 +34,29 @@ from .upstream import (
     AnthropicAdapter,
     MockAdapter,
     Upstream,
+    UpstreamRefused,
     UpstreamTimeout,
     UpstreamUnavailable,
 )
 
+MAX_MESSAGE_CHARS = 20_000
+MAX_TOTAL_CHARS = 100_000  # bounds the work one request can cause in the guardrails
+MAX_BODY_BYTES = (
+    1 << 20
+)  # 1 MiB: room for 100,000 characters in any encoding, far below the pod's memory limit
+REQUEST_ID = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+# Upstream failure -> (kind used in metrics and the error code, HTTP status).
+UPSTREAM_FAILURES: dict[type[Exception], tuple[str, int]] = {
+    UpstreamTimeout: ("timeout", 504),
+    UpstreamUnavailable: ("unavailable", 502),
+    UpstreamRefused: ("refused", 502),
+}
+
 
 class Message(BaseModel):
     role: str = Field(pattern="^(system|user|assistant)$")
-    content: str = Field(max_length=20000)
-
-
-MAX_TOTAL_CHARS = 100_000  # bounds the work one request can cause in the guardrails
-REQUEST_ID = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+    content: str = Field(max_length=MAX_MESSAGE_CHARS)
 
 
 class ChatRequest(BaseModel):
@@ -55,12 +69,66 @@ class ChatRequest(BaseModel):
         return self
 
 
+class _BodyTooLarge(Exception):
+    """Raised inside the receive channel when a streamed body crosses the limit."""
+
+
+class BodyLimit:
+    """Reject oversized bodies before they are read into memory.
+
+    A declared Content-Length over the limit is refused at once. A body that is streamed (chunked, or a lying
+    Content-Length) is counted as it arrives and aborted when it crosses the limit. FastAPI turns an error raised
+    while it reads the body into its own 400, so the response it sends is replaced with the 413.
+    """
+
+    def __init__(self, app: ASGIApp, limit: int, refuse: Callable[[Request], JSONResponse]) -> None:
+        self.app, self.limit, self.refuse = app, limit, refuse
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        declared = dict(scope["headers"]).get(b"content-length", b"")
+        if declared.isdigit() and int(declared) > self.limit:
+            await self.refuse(Request(scope))(scope, receive, send)
+            return
+        seen, tripped = 0, False
+
+        async def counting_receive() -> AsgiMessage:
+            nonlocal seen, tripped
+            message = await receive()
+            if message["type"] == "http.request":
+                seen += len(message.get("body", b""))
+                if seen > self.limit:
+                    tripped = True
+                    raise _BodyTooLarge
+            return message
+
+        async def guarded_send(message: AsgiMessage) -> None:
+            if not tripped:
+                await send(message)
+            elif message["type"] == "http.response.start":
+                await self.refuse(Request(scope))(
+                    scope, receive, send
+                )  # sends the whole 413; the app's error is dropped
+
+        try:
+            await self.app(scope, counting_receive, guarded_send)
+        except _BodyTooLarge:
+            await guarded_send({"type": "http.response.start"})
+
+
 def build_upstream(s: Settings, client: httpx.AsyncClient) -> Upstream:
     if s.upstream_kind == "anthropic":
         if not s.anthropic_api_key:
             raise RuntimeError("UPSTREAM_KIND=anthropic but ANTHROPIC_API_KEY is empty")
         return AnthropicAdapter(
-            s.upstream_url, s.anthropic_api_key, s.upstream_model, client, max_tokens=s.max_tokens
+            s.upstream_url,
+            s.anthropic_api_key,
+            s.upstream_model,
+            client,
+            max_tokens=s.max_tokens,
+            effort=s.effort,
         )
     return MockAdapter(s.upstream_url, client)
 
@@ -126,7 +194,40 @@ def create_app(
         yield
         await client.aclose()
 
+    def refuse_too_large(request: Request) -> JSONResponse:
+        rid = _request_id(request)
+        log.info("request", extra={"request_id": rid, "decision": "too_large", "status": 413})
+        body = {"request_id": rid, "error": "request_too_large", "max_bytes": MAX_BODY_BYTES}
+        return _reply(rid, "-", 413, body)
+
     app = FastAPI(title="llm-guardrail-gateway", lifespan=lifespan)
+    app.add_middleware(BodyLimit, limit=MAX_BODY_BYTES, refuse=refuse_too_large)
+
+    def respond(
+        rid: str,
+        policy_version: str,
+        status: int,
+        decision: str,
+        body: dict[str, Any],
+        level: int = logging.INFO,
+        **log_fields: Any,
+    ) -> JSONResponse:
+        """Count, log and answer one chat request: the single place a request's outcome is recorded."""
+        metrics.requests.labels(decision).inc()
+        log.log(
+            level,
+            "request",
+            extra={
+                "request_id": rid,
+                "policy_version": policy_version,
+                "decision": decision,
+                "status": status,
+                **log_fields,
+            },
+        )
+        return _reply(
+            rid, policy_version, status, {"request_id": rid, "policy_version": policy_version, **body}
+        )
 
     @app.exception_handler(RequestValidationError)
     async def invalid_request(request: Request, exc: RequestValidationError) -> JSONResponse:
@@ -180,50 +281,41 @@ def create_app(
         pol: Policy | None = request.app.state.policy
         if pol is None:
             return _reply(rid, "-", 503, {"request_id": rid, "error": "policy_not_loaded"})
-        base: dict[str, Any] = {"request_id": rid, "policy_version": pol.version}
 
         # Regex work is CPU-bound: keep it off the event loop so /healthz stays responsive.
         res = await run_in_threadpool(check_input, [m.model_dump() for m in req.messages], pol)
         for rule, n in res.hits.items():
             metrics.rule_hits.labels(rule, "input").inc(n)
         if res.decision == "blocked":
-            metrics.requests.labels("blocked").inc()
-            log.info(
-                "request",
-                extra={
-                    **base,
-                    "decision": "blocked",
-                    "reason": res.reason,
-                    "rules": res.hits,
-                    "upstream_ms": None,
-                    "status": 403,
-                },
+            return respond(
+                rid,
+                pol.version,
+                403,
+                "blocked",
+                {"decision": "blocked", "reason": res.reason, "rules": res.hits},
+                reason=res.reason,
+                rules=res.hits,
+                upstream_ms=None,
             )
-            body = {**base, "decision": "blocked", "reason": res.reason, "rules": res.hits}
-            return _reply(rid, pol.version, 403, body)
 
         t0 = time.perf_counter()
         try:
             text = await request.app.state.upstream.complete(res.messages)
-        except (UpstreamTimeout, UpstreamUnavailable) as exc:
-            kind, status = ("timeout", 504) if isinstance(exc, UpstreamTimeout) else ("unavailable", 502)
+        except tuple(UPSTREAM_FAILURES) as exc:
+            kind, status = UPSTREAM_FAILURES[type(exc)]
             metrics.upstream_errors.labels(kind).inc()
-            metrics.requests.labels("upstream_error").inc()
-            ms = round((time.perf_counter() - t0) * 1000)
-            log.warning(
-                "request",
-                extra={
-                    **base,
-                    "decision": "upstream_error",
-                    "error": kind,
-                    "detail": str(exc)[:200],
-                    "upstream_ms": ms,
-                    "status": status,
-                },
-            )
             # The raw exception text stays in the log; the caller gets only the class of failure.
-            body = {**base, "error": f"upstream_{kind}"}
-            return _reply(rid, pol.version, status, body)
+            return respond(
+                rid,
+                pol.version,
+                status,
+                "upstream_error",
+                {"error": f"upstream_{kind}"},
+                level=logging.WARNING,
+                error=kind,
+                detail=str(exc)[:200],
+                upstream_ms=round((time.perf_counter() - t0) * 1000),
+            )
         elapsed = time.perf_counter() - t0
         metrics.upstream_latency.observe(elapsed)
 
@@ -231,20 +323,16 @@ def create_app(
         for rule, n in out_hits.items():
             metrics.rule_hits.labels(rule, "output").inc(n)
         decision = "redacted" if (res.decision == "redacted" or out_hits) else "allow"
-        metrics.requests.labels(decision).inc()
-        log.info(
-            "request",
-            extra={
-                **base,
-                "decision": decision,
-                "rules": res.hits,
-                "output_rules": out_hits,
-                "upstream_ms": round(elapsed * 1000),
-                "status": 200,
-            },
+        return respond(
+            rid,
+            pol.version,
+            200,
+            decision,
+            {"decision": decision, "reply": text, "rules": res.hits, "output_rules": out_hits},
+            rules=res.hits,
+            output_rules=out_hits,
+            upstream_ms=round(elapsed * 1000),
         )
-        body = {**base, "decision": decision, "reply": text, "rules": res.hits, "output_rules": out_hits}
-        return _reply(rid, pol.version, 200, body)
 
     return app
 
