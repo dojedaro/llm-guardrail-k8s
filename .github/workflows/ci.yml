@@ -1,0 +1,101 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install -r app/gateway/requirements.txt pytest pytest-asyncio ruff
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: pytest tests/unit -q
+
+  chart:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: azure/setup-helm@v4
+      - name: Install kubeconform
+        run: |
+          curl -sSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz | tar xz
+          sudo mv kubeconform /usr/local/bin/
+      - name: helm lint
+        run: |
+          helm lint charts/llm-guardrail
+          helm lint charts/llm-guardrail -f charts/llm-guardrail/values-airgapped.yaml
+          helm lint charts/llm-guardrail -f charts/llm-guardrail/values-external-llm.yaml \
+            --set 'networkPolicy.externalLLM.cidrs={203.0.113.10/32}'
+      - name: helm template + kubeconform
+        run: |
+          helm template t charts/llm-guardrail --set ingress.enabled=true --set autoscaling.enabled=true \
+            | kubeconform -strict -summary -kubernetes-version 1.31.0 -
+          helm template t charts/llm-guardrail -f charts/llm-guardrail/values-airgapped.yaml \
+            | kubeconform -strict -summary -kubernetes-version 1.31.0 -
+          helm template t charts/llm-guardrail -f charts/llm-guardrail/values-external-llm.yaml \
+            --set 'networkPolicy.externalLLM.cidrs={203.0.113.10/32}' --set gateway.secret.existingSecret=k \
+            | kubeconform -strict -summary -kubernetes-version 1.31.0 -
+      - name: Schema and guards reject bad values
+        run: |
+          expect_fail() { if "$@" >/dev/null 2>&1; then echo "should have failed: $*"; exit 1; fi; }
+          expect_fail helm template t charts/llm-guardrail --set gateway.image.tag=latest
+          expect_fail helm template t charts/llm-guardrail --set policy.pii.mode=maybe
+          expect_fail helm template t charts/llm-guardrail -f charts/llm-guardrail/values-external-llm.yaml
+
+  e2e:
+    needs: [python, chart]
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      CLUSTER_NAME: guardrail
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: azure/setup-helm@v4
+      # Calico cluster so the NetworkPolicy enforcement drill is meaningful in CI.
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: guardrail
+          config: kind/cluster-calico.yaml
+          wait: 0s
+      - name: Install Calico
+        run: |
+          kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/calico.yaml
+          kubectl -n kube-system rollout status ds/calico-node --timeout=300s
+          kubectl wait --for=condition=Ready nodes --all --timeout=300s
+      - name: Build images and load into kind
+        run: scripts/build-images.sh
+      - name: Install chart
+        run: |
+          helm upgrade --install guardrail charts/llm-guardrail -n guardrail --create-namespace \
+            --wait --timeout 240s
+      - name: helm test
+        run: helm test guardrail -n guardrail --logs
+      - name: Integration tests
+        run: |
+          pip install -r app/gateway/requirements.txt pytest pytest-asyncio
+          pytest tests/integration -v -rs
+      - name: NetworkPolicy enforcement drill
+        run: drills/06-networkpolicy-enforcement.sh
+      - name: Upgrade and rollback
+        run: scripts/upgrade-rollback-demo.sh
+      - name: Support bundle on failure
+        if: failure()
+        run: scripts/collect-diagnostics.sh
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: diagnostics
+          path: diagnostics-*.tar.gz
