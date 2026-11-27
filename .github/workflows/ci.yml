@@ -1,5 +1,8 @@
 name: ci
 
+# Not yet run on GitHub (the repo has not been pushed). Every step below is a command that was run locally; see
+# docs/EVIDENCE.md for the dated outputs. Action versions are major tags and should be re-checked on first push.
+
 on:
   push:
     branches: [main]
@@ -8,94 +11,100 @@ on:
 permissions:
   contents: read
 
+env:
+  HELM_VERSION: v4.3.2        # the version the chart was tested with (Helm 4 server-side apply, --rollback-on-failure)
+  KIND_VERSION: v0.33.0
+  KIND_NODE_IMAGE: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+  CALICO_VERSION: v3.28.2
+
 jobs:
   python:
+    # Python 3.12 and the gateway's pinned requirements: the same interpreter and dependencies as the image.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - run: pip install -r app/gateway/requirements.txt pytest pytest-asyncio ruff
+      - run: pip install -r app/gateway/requirements.txt -r requirements-dev.txt
       - run: ruff check .
       - run: ruff format --check .
       - run: pytest tests/unit -q
+      - run: tests/scripts/test-redact.sh
 
   chart:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash   # bash with -eo pipefail, so a failing `helm template | kubeconform` fails the step
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install pyyaml==6.0.2
       - uses: azure/setup-helm@v4
-      - name: Install kubeconform
-        run: |
-          curl -sSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz | tar xz
-          sudo mv kubeconform /usr/local/bin/
-      - name: helm lint
-        run: |
-          helm lint charts/llm-guardrail
-          helm lint charts/llm-guardrail -f charts/llm-guardrail/values-airgapped.yaml
-          helm lint charts/llm-guardrail -f charts/llm-guardrail/values-external-llm.yaml \
-            --set 'networkPolicy.externalLLM.cidrs={203.0.113.10/32}'
-      - name: helm template + kubeconform
-        run: |
-          helm template t charts/llm-guardrail --set ingress.enabled=true --set autoscaling.enabled=true \
-            | kubeconform -strict -summary -kubernetes-version 1.31.0 -
-          helm template t charts/llm-guardrail -f charts/llm-guardrail/values-airgapped.yaml \
-            | kubeconform -strict -summary -kubernetes-version 1.31.0 -
-          helm template t charts/llm-guardrail -f charts/llm-guardrail/values-external-llm.yaml \
-            --set 'networkPolicy.externalLLM.cidrs={203.0.113.10/32}' --set gateway.secret.existingSecret=k \
-            | kubeconform -strict -summary -kubernetes-version 1.31.0 -
-      - name: Schema and guards reject bad values
-        run: |
-          expect_fail() { if "$@" >/dev/null 2>&1; then echo "should have failed: $*"; exit 1; fi; }
-          expect_fail helm template t charts/llm-guardrail --set gateway.image.tag=latest
-          expect_fail helm template t charts/llm-guardrail --set policy.pii.mode=maybe
-          expect_fail helm template t charts/llm-guardrail -f charts/llm-guardrail/values-external-llm.yaml
+        with:
+          version: ${{ env.HELM_VERSION }}
+      # helm lint + template for every values file, strict duplicate-key check, kubeconform -strict (container image),
+      # and the "bad values must be rejected" tests.
+      - run: PYBIN=python scripts/chart-check.sh
+
+  image-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: docker build -t llm-guardrail/gateway:ci app/gateway
+      - uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: llm-guardrail/gateway:ci
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
 
   e2e:
     needs: [python, chart]
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     env:
-      CLUSTER_NAME: guardrail
+      REQUIRE_CLUSTER: "1"   # a missing cluster fails the integration tests instead of skipping them
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+      - run: pip install -r app/gateway/requirements.txt -r requirements-dev.txt
       - uses: azure/setup-helm@v4
-      # Calico cluster so the NetworkPolicy enforcement drill is meaningful in CI.
+        with:
+          version: ${{ env.HELM_VERSION }}
       - uses: helm/kind-action@v1
         with:
-          cluster_name: guardrail
-          config: kind/cluster-calico.yaml
-          wait: 0s
-      - name: Install Calico
-        run: |
-          kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/calico.yaml
-          kubectl -n kube-system rollout status ds/calico-node --timeout=300s
-          kubectl wait --for=condition=Ready nodes --all --timeout=300s
-      - name: Build images and load into kind
-        run: scripts/build-images.sh
+          install_only: true
+          version: ${{ env.KIND_VERSION }}
+      # Creates the 3-node Calico cluster, installs ingress-nginx, builds both images and loads them into kind.
+      - name: Cluster
+        run: CNI=calico scripts/cluster-up.sh
       - name: Install chart
         run: |
-          helm upgrade --install guardrail charts/llm-guardrail -n guardrail --create-namespace \
-            --wait --timeout 240s
-      - name: helm test
-        run: helm test guardrail -n guardrail --logs
+          helm install guardrail charts/llm-guardrail -n guardrail --create-namespace \
+            -f charts/llm-guardrail/values-kind.yaml --wait --timeout 240s
+      - run: helm test guardrail -n guardrail --logs
       - name: Integration tests
-        run: |
-          pip install -r app/gateway/requirements.txt pytest pytest-asyncio
-          pytest tests/integration -v -rs
-      - name: NetworkPolicy enforcement drill
-        run: drills/06-networkpolicy-enforcement.sh
-      - name: Upgrade and rollback
+        run: pytest tests/integration -v -rs
+      - name: Environment assessment with the NetworkPolicy probe
+        run: PROBE_NETPOL=1 scripts/preflight.sh
+      - run: drills/06-networkpolicy-enforcement.sh
+      - name: Upgrade, image upgrade and rollback
         run: scripts/upgrade-rollback-demo.sh
-      - name: Support bundle on failure
-        if: failure()
+      - name: Guardrail evaluation (measurement only, prints false-positive / false-negative rates)
+        run: python scripts/eval_guardrails.py --json eval-results.json
+      - name: Support bundle
+        if: always()
         run: scripts/collect-diagnostics.sh
       - uses: actions/upload-artifact@v4
-        if: failure()
+        if: always()
         with:
-          name: diagnostics
-          path: diagnostics-*.tar.gz
+          name: diagnostics-and-eval
+          path: |
+            diagnostics-*.tar.gz
+            eval-results.json
