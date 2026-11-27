@@ -6,6 +6,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
+# Same base-image fix as the gateway image (libpam CVE-2025-6020); remove with it.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends --only-upgrade \
+       libpam0g libpam-modules libpam-modules-bin libpam-runtime \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install -r requirements.txt

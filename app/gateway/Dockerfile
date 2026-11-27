@@ -5,10 +5,18 @@ FROM python:3.12.16-slim-bookworm
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1     PORT=8080
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PORT=8080
 # Reported by /readyz so an upgrade can be verified from outside: docker build --build-arg GATEWAY_VERSION=0.1.1
 ARG GATEWAY_VERSION=0.1.0
 ENV GATEWAY_VERSION=${GATEWAY_VERSION}
+
+# Security fixes the pinned base tag does not have yet (Trivy: libpam CVE-2025-6020, fixed in 1.5.2-6+deb12u3).
+# Remove this layer when the base tag is bumped to one that already ships the fixed packages.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends --only-upgrade \
+       libpam0g libpam-modules libpam-modules-bin libpam-runtime \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY requirements.txt .
