@@ -8,7 +8,7 @@ set -uo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 need helm docker
 mkdir -p "$REPO_ROOT/reports"
-KUBE_VERSION="${KUBE_VERSION:-1.31.0}"
+KUBE_VERSION="${KUBE_VERSION:-1.37.0}"   # newest schema set published for the cluster version used here (yannh/kubernetes-json-schema)
 KUBECONFORM_IMAGE="${KUBECONFORM_IMAGE:-ghcr.io/yannh/kubeconform@sha256:0925177fb05b44ce18574076141b5c3d83235e1904d3f952182ac99ddc45762c}" # v0.6.7
 C="$CHART"
 fails=0

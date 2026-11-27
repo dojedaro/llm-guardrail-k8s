@@ -54,15 +54,15 @@ def rrn_valid(front: str, back: str) -> bool:
 # ---- PII patterns ---------------------------------------------------------
 
 # Quantifiers are bounded on purpose: an unbounded local-part scan is quadratic on input such as
-# "a.a.a.a." (0.4 s per 20 kB measured), and guardrails sit on the request path.
-EMAIL = re.compile(
-    r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}\.[A-Za-z]{2,24}"
-)
-# A run of digit groups separated by single spaces or hyphens, however long. Card detection then tries
+# "a.a.a.a." (0.4 s per 20 kB measured), and guardrails sit on the request path. There is no lookbehind:
+# with one, a local part longer than 64 characters (or glued to a long token) was never matched at all.
+# Now the 64 characters before the "@" are redacted, which is the longest local part RFC 5321 allows.
+EMAIL = re.compile(r"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}\.[A-Za-z]{2,24}")
+# A run of digit groups separated by one or two spaces, dots, hyphens or line breaks, however long. Card detection then tries
 # Luhn on runs of 1-5 consecutive groups, so "order 12345 4111 1111 1111 1111" and a card after a
 # date, a phone number or any amount of other digits are still found. Linear: a separator is required
 # between groups, so the engine never re-reads a group.
-DIGIT_RUN = re.compile(r"(?<!\d)\d+(?:[ -]\d+)*(?!\d)")
+DIGIT_RUN = re.compile(r"(?<!\d)\d+(?:[ .\-\r\n]{1,2}\d+)*(?!\d)")
 RRN = re.compile(r"(?<!\d)(\d{6})[- ]?([1-8]\d{6})(?!\d)")
 # Korean mobile/landline (010-1234-5678, 010.1234.5678, 02-123-4567, +82 10 1234 5678) and
 # generic international numbers written with a leading + (optionally with (area) parentheses).
@@ -194,15 +194,35 @@ def redact(text: str, findings: list[Finding]) -> str:
 # rule blocks on its own, so those rules are written narrowly: they need the verb, the target ("previous
 # instructions") and nothing that makes it ordinary text ("ignore the formatting rules in my previous
 # email" must not match).
-_TARGET = r"(?:instructions?|rules?|prompts?|guidelines?|directions?|messages?|context)"
-_PRIOR = r"(?:previous|prior|above|earlier|preceding|former|original|system)"
+_TARGET = r"(?:instructions?|rules?|prompts?|guidelines?|directions?)"
+_PRIOR = r"(?:previous|prior|above|earlier|preceding|former)"
+# Verbs that drop instructions: "ignore", "do not follow", "stop following".
+_DROP = r"(?:ignore|disregard|forget|override|bypass|(?:do\s+not|don'?t|stop)\s+follow(?:ing)?)"
+# The model's own prompt, as an attack names it ("your system prompt", "your instructions").
+_OWN_PROMPT = (
+    r"(?:(?:system|hidden|initial|original|secret|internal|full|exact|developer)\s+)?"
+    r"(?:prompt|instructions?|rules|guidelines)"
+)
+_MODEL_NOUN = r"(?:ai|assistant|model|chatbot|bot|llm|gpt)"
+_NO_LIMITS = (
+    r"(?:no|without|free\s+(?:of|from))\s+(?:any\s+)?(?:content\s+|safety\s+)?"
+    r"(?:restrictions?|rules|filters?|limits|limitations|guidelines|censorship)\b"
+)
 INJECTION_RULES: tuple[tuple[str, int, re.Pattern[str]], ...] = (
     (
         "inj_ignore_previous",
         3,
         re.compile(
-            r"\b(?:ignore|disregard|forget|override|bypass)\s+(?:all\s+|any\s+|every\s+)?(?:of\s+)?"
+            # "ignore all previous instructions", "do not follow the prior rules"
+            r"\b" + _DROP + r"\s+(?:all\s+|any\s+|every\s+)?(?:of\s+)?"
             r"(?:the\s+|your\s+|my\s+|these\s+|those\s+)?" + _PRIOR + r"\s+" + _TARGET + r"\b"
+            # "ignore your instructions", "disregard your system prompt", "stop following your rules"
+            r"|\b" + _DROP + r"\s+(?:all\s+|any\s+)?(?:of\s+)?your\s+" + _OWN_PROMPT + r"\b"
+            # "ignore the system prompt"
+            r"|\b"
+            + _DROP
+            + r"\s+(?:all\s+|any\s+)?(?:the\s+)?(?:system|developer)\s+(?:prompt|instructions?)\b"
+            # "ignore all instructions above"
             r"|\b(?:ignore|disregard|forget)\s+(?:all\s+|any\s+)?(?:the\s+|your\s+)?"
             + _TARGET
             + r"\s+(?:above|before)\b"
@@ -214,24 +234,43 @@ INJECTION_RULES: tuple[tuple[str, int, re.Pattern[str]], ...] = (
         "inj_reveal_system_prompt",
         3,
         re.compile(
-            r"\b(?:reveal|show|print|repeat|leak|output|display|tell\s+me)\b(?:\s+me)?\s+(?:all\s+)?"
-            r"(?:of\s+)?(?:your|the|its)\s+(?:system|hidden|initial|original|secret|internal)\s+"
-            r"(?:prompt|instructions?|message)s?\b",
+            # "reveal your system prompt", "repeat your instructions", "leak its hidden prompt"
+            r"\b(?:reveal|show|print|repeat|leak|output|display|disclose|tell\s+me)\b(?:\s+me)?\s+(?:all\s+)?(?:of\s+)?"
+            r"(?:your|its)\s+" + _OWN_PROMPT + r"\b"
+            # "show the system prompt": "the" is accepted only with "prompt"; "the system message" and
+            # "the internal instructions" are everyday phrases
+            r"|\b(?:reveal|show|print|repeat|leak|output|display|disclose)\b(?:\s+me)?\s+(?:all\s+)?(?:of\s+)?"
+            r"the\s+(?:system|hidden|initial|secret)\s+prompt\b"
+            # "what is your system prompt?"
+            r"|\bwhat(?:'s|\s+is|\s+are)\s+your\s+"
+            r"(?:(?:system|hidden|initial|original|secret|full|exact)\s+(?:prompt|instructions?)|prompt)\b",
             re.I,
         ),
     ),
     (
         "inj_repeat_above",
         3,
-        re.compile(r"\brepeat\s+(?:the\s+|all\s+)?(?:text|words|everything)\s+above\b", re.I),
+        re.compile(
+            r"\b(?:repeat|print|output|copy)\s+(?:the\s+|all\s+)?(?:text|words|everything)\s+above\b"
+            r"|\b(?:repeat|print|output|copy)\s+everything\s+(?:above|before)\s+this\s+(?:line|point|message)\b",
+            re.I,
+        ),
     ),
     (
         "inj_no_restrictions",
         3,
         re.compile(
-            r"\b(?:pretend|act|behave|imagine|respond)\b.{0,40}\b(?:no|without|free\s+(?:of|from))\s+"
-            r"(?:any\s+)?(?:content\s+)?(?:restrictions?|rules|filters?|limits|limitations|guidelines|censorship)\b"
-            r"|\b(?:act|behave|respond)\s+as\s+(?:an?\s+)?(?:unrestricted|unfiltered|uncensored)\b"
+            # "pretend you have no restrictions", "act as if you were free of any rules": the subject is the model
+            r"\b(?:pretend|act|behave|respond|answer)\b.{0,40}\byou\b.{0,30}\b"
+            + _NO_LIMITS
+            # "act as an AI with no restrictions"
+            + r"|\b(?:act|behave|respond)\s+as\s+(?:an?\s+)?(?:\w+\s+)?"
+            + _MODEL_NOUN
+            + r"\b.{0,20}\b(?:with|having)\s+"
+            + _NO_LIMITS
+            + r"|\b(?:act|behave|respond)\s+as\s+(?:an?\s+)?(?:unrestricted|unfiltered|uncensored)\s+"
+            + _MODEL_NOUN
+            + r"\b"
             r"|\banswer\s+without\s+(?:any\s+)?(?:restrictions?|filters?|limits|censorship)\b",
             re.I | re.S,
         ),
@@ -243,7 +282,7 @@ INJECTION_RULES: tuple[tuple[str, int, re.Pattern[str]], ...] = (
         re.compile(
             r"(?i:\byou\s+are\s+now\b|\bact\s+as\s+(?:an?\s+)?unrestricted\b"
             r"|\bfrom\s+now\s+on,?\s+you\s+(?:will|are|must)\b)"
-            r"|(?i:\bact\s+as\s+(?:an?\s+)?)DAN\b"
+            r"|(?i:\b(?:act\s+as\s+(?:an?\s+)?|you\s+are\s+(?:now\s+)?))DAN\b"
         ),
     ),
     (
@@ -261,7 +300,8 @@ INJECTION_RULES: tuple[tuple[str, int, re.Pattern[str]], ...] = (
         "inj_ko_ignore_previous",
         3,
         re.compile(
-            r"(?:이전|위의|앞의|기존|모든)\s*(?:모든\s*)?(?:지시|지침|명령|프롬프트|규칙)(?:사항|들)?[을를은는]?\s*(?:모두\s*)?(?:무시|잊어|따르지)"
+            r"(?:이전|위의|앞의|기존|모든)\s*(?:모든\s*)?(?:지시|지침|명령|프롬프트|규칙)(?:사항|들)?[을를은는]?\s*(?:모두\s*)?"
+            r"(?:무시\s*(?:하세요|하십시오|하라|하고|해\s*(?:주세요|줘|라|요)?|해라)|잊어\s*(?:버려|버리세요|줘|라|주세요)|따르지\s*마)"
         ),
     ),
     (

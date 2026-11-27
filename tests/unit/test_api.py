@@ -4,9 +4,17 @@ import logging
 import pytest
 from fastapi.testclient import TestClient
 from gateway.config import Settings
-from gateway.main import MAX_BODY_BYTES, build_upstream, create_app
+from gateway.main import MAX_BODY_BYTES, REQUEST_ID, build_upstream, create_app
 from gateway.policy import Policy
-from gateway.upstream import UpstreamRefused, UpstreamTimeout, UpstreamUnavailable
+from gateway.upstream import (
+    UpstreamAuth,
+    UpstreamBadRequest,
+    UpstreamOverloaded,
+    UpstreamRateLimited,
+    UpstreamRefused,
+    UpstreamTimeout,
+    UpstreamUnavailable,
+)
 
 SETTINGS = Settings("mock", "http://x", "m", 1.0, "", "/nonexistent.yaml", "INFO")
 
@@ -84,6 +92,10 @@ def test_output_redaction():
         (UpstreamTimeout("t"), 504, "upstream_timeout"),
         (UpstreamUnavailable("refused"), 502, "upstream_unavailable"),
         (UpstreamRefused("model refused"), 502, "upstream_refused"),
+        (UpstreamAuth("HTTP 401"), 502, "upstream_auth"),
+        (UpstreamBadRequest("HTTP 400"), 502, "upstream_bad_request"),
+        (UpstreamOverloaded("HTTP 529"), 503, "upstream_overloaded"),
+        (UpstreamRateLimited("HTTP 429"), 429, "upstream_rate_limited"),
     ],
 )
 def test_upstream_errors(err, status, code):
@@ -91,6 +103,62 @@ def test_upstream_errors(err, status, code):
         r = chat(c, "hi")
     assert r.status_code == status and r.json()["error"] == code
     assert r.json()["request_id"] == r.headers["x-request-id"]
+
+
+@pytest.mark.parametrize("given,expected", [(30, "30"), (None, "5"), (9999, "120")])
+def test_rate_limit_is_passed_through_with_retry_after(given, expected):
+    with client(FakeUpstream(error=UpstreamRateLimited("HTTP 429", given))) as c:
+        r = chat(c, "hi")
+        metrics = c.get("/metrics").text
+    assert r.status_code == 429 and r.headers["retry-after"] == expected
+    assert 'gateway_upstream_errors_total{kind="rate_limited"} 1.0' in metrics
+
+
+def test_each_upstream_failure_has_its_own_metric_kind():
+    errors = {
+        "auth": UpstreamAuth("a"),
+        "bad_request": UpstreamBadRequest("b"),
+        "overloaded": UpstreamOverloaded("o"),
+        "unavailable": UpstreamUnavailable("u"),
+    }
+    for kind, err in errors.items():
+        with client(FakeUpstream(error=err)) as c:
+            chat(c, "hi")
+            assert f'gateway_upstream_errors_total{{kind="{kind}"}} 1.0' in c.get("/metrics").text
+
+
+@pytest.mark.parametrize(
+    "messages",
+    [
+        [{"role": "system", "content": "be brief"}],
+        [{"role": "assistant", "content": "hello"}],
+        [{"role": "system", "content": "s"}, {"role": "assistant", "content": "a"}],
+    ],
+)
+def test_a_conversation_needs_at_least_one_user_message(messages):
+    up = FakeUpstream()
+    with client(up) as c:
+        r = c.post("/v1/chat", json={"messages": messages})
+    assert r.status_code == 422 and "role 'user'" in r.text and up.seen is None
+
+
+def test_system_prompt_plus_user_message_is_still_accepted():
+    messages = [{"role": "system", "content": "be brief"}, {"role": "user", "content": "hi"}]
+    with client() as c:
+        assert c.post("/v1/chat", json={"messages": messages}).status_code == 200
+
+
+def test_unknown_request_fields_are_rejected():
+    with client() as c:
+        body = {"messages": [{"role": "user", "content": "hi"}], "temperature": 0}
+        assert c.post("/v1/chat", json=body).status_code == 422
+        body = {"messages": [{"role": "user", "content": "hi", "name": "x"}]}
+        assert c.post("/v1/chat", json=body).status_code == 422
+
+
+def test_request_id_must_match_in_full():
+    assert REQUEST_ID.fullmatch("abc-123_x.9")
+    assert not REQUEST_ID.fullmatch("abc" + chr(10))  # "$" would have accepted a trailing newline
 
 
 def test_validation_error():
@@ -180,11 +248,16 @@ def test_health_and_ready():
         assert r.status_code == 503 and r.json()["upstream_reachable"] is False
 
 
-def test_not_ready_without_policy():
+def test_not_ready_without_policy(capsys):
     app = create_app(SETTINGS, FakeUpstream(), None)  # path does not exist
     with TestClient(app) as c:
         assert c.get("/readyz").status_code == 503
-        assert chat(c, "hi").status_code == 503
+        r = chat(c, "hi")
+        assert r.status_code == 503 and r.json()["error"] == "policy_not_loaded"
+        assert r.headers["x-request-id"] == r.json()["request_id"]
+        assert 'gateway_requests_total{decision="policy_not_loaded"} 1.0' in c.get("/metrics").text
+    lines = [json.loads(ln) for ln in capsys.readouterr().out.splitlines() if ln.startswith("{")]
+    assert any(ln.get("decision") == "policy_not_loaded" and ln["status"] == 503 for ln in lines)
 
 
 def test_metrics_increment():

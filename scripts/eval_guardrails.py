@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
-SPLITS = ("tuned", "fresh", "multiturn")
+SPLITS = ("tuned", "fresh", "multiturn", "review")
 METRICS = (
     ("benign", "false_positive", "false positives (benign blocked or redacted)"),
     ("pii", "false_negative_pii", "false negatives, PII not redacted"),

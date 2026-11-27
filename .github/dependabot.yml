@@ -1,0 +1,13 @@
+# Keeps the pinned versions current. Actions are pinned to commits, so Dependabot proposes the new commit and
+# release comment; pip and Docker cover the gateway/mock-llm requirements and the base images.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly }
+  - package-ecosystem: pip
+    directories: [/app/gateway, /app/mock-llm, /]
+    schedule: { interval: weekly }
+  - package-ecosystem: docker
+    directories: [/app/gateway, /app/mock-llm]
+    schedule: { interval: weekly }

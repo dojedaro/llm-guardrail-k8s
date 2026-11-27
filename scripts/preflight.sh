@@ -145,11 +145,31 @@ if [[ "${PROBE_NETPOL:-0}" == "1" ]]; then
   img="${PROBE_IMAGE:-busybox:1.36.1}"; pns=np-probe
   kubectl delete ns "$pns" --ignore-not-found --wait=true >/dev/null 2>&1
   kubectl create ns "$pns" >/dev/null 2>&1
+  # pod <name> <shell command>: a pod that runs the command once. It runs non-root with every capability dropped, so a
+  # cluster that enforces the "restricted" Pod Security profile admits it too.
+  pod() {
+    kubectl -n "$pns" apply -f - >/dev/null 2>&1 <<YAML
+apiVersion: v1
+kind: Pod
+metadata: { name: $1 }
+spec:
+  restartPolicy: Never
+  securityContext: { runAsNonRoot: true, runAsUser: 10001, seccompProfile: { type: RuntimeDefault } }
+  containers:
+    - name: c
+      image: $img
+      ports: [{ containerPort: 8080 }]
+      securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
+      command: [sh, -c]
+      args:
+        - |
+          $2
+YAML
+  }
   probe() { # probe <pod-name>: run a client pod to completion and print wget's output plus its exit code.
     # (Not `kubectl run -i --rm`: attaching races the container and can lose the output.)
     local n="$1" phase
-    kubectl -n "$pns" run "$n" --restart=Never --image="$img" --command -- \
-      sh -c "wget -q -T 4 -O- http://$ip:8080/ 2>&1; echo exit=\$?" >/dev/null 2>&1
+    pod "$n" "wget -q -T 4 -O- http://$ip:8080/ 2>&1; echo exit=\$?"
     for _ in $(seq 1 60); do
       phase="$(kubectl -n "$pns" get pod "$n" -o jsonpath='{.status.phase}' 2>/dev/null)"
       [[ "$phase" == Succeeded || "$phase" == Failed ]] && break
@@ -158,8 +178,7 @@ if [[ "${PROBE_NETPOL:-0}" == "1" ]]; then
     kubectl -n "$pns" logs "$n" 2>&1
     kubectl -n "$pns" delete pod "$n" --wait=false >/dev/null 2>&1
   }
-  kubectl -n "$pns" run srv --image="$img" --restart=Never --port=8080 --command -- \
-    sh -c 'mkdir -p /www && echo probe-ok > /www/index.html && exec httpd -f -p 8080 -h /www' >/dev/null 2>&1
+  pod srv 'mkdir -p /tmp/www && echo probe-ok > /tmp/www/index.html && exec httpd -f -p 8080 -h /tmp/www'
   if ! kubectl -n "$pns" wait --for=condition=Ready pod/srv --timeout=90s >/dev/null 2>&1; then
     emit WARN "networkpolicy enforcement" "probe inconclusive: server pod did not become Ready (image $img pullable?)"
   else

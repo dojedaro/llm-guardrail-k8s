@@ -20,7 +20,7 @@ log "collecting from namespace '$NS' into $DIR"
 { date -u +%FT%TZ; kubectl version; kubectl config current-context; } 2>&1 | redact > "$DIR/00-environment.txt"
 save 01-nodes.txt            kubectl get nodes -o wide
 save 02-nodes-describe.txt   kubectl describe nodes
-save 03-workloads.txt        kubectl -n "$NS" get all,cm,ingress,networkpolicy,pdb,hpa -o wide
+save 03-workloads.txt        kubectl -n "$NS" get all,cm,ingress,networkpolicy,pdb -o wide
 save 04-events.txt           kubectl -n "$NS" get events --sort-by=.lastTimestamp
 save 05-secrets-names.txt    kubectl -n "$NS" get secrets   # names/types only, never values
 save 06-networkpolicies.txt  kubectl -n "$NS" get networkpolicy -o yaml

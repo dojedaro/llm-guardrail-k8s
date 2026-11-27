@@ -5,6 +5,10 @@ import pytest
 from gateway.upstream import (
     AnthropicAdapter,
     MockAdapter,
+    UpstreamAuth,
+    UpstreamBadRequest,
+    UpstreamOverloaded,
+    UpstreamRateLimited,
     UpstreamRefused,
     UpstreamTimeout,
     UpstreamUnavailable,
@@ -192,3 +196,33 @@ async def test_empty_completion_at_max_tokens_points_at_the_limit():
     a = AnthropicAdapter("https://x", "k", "m", client_with(lambda r: empty))
     with pytest.raises(UpstreamUnavailable, match="UPSTREAM_MAX_TOKENS"):
         await a.complete([{"role": "user", "content": "hi"}])
+
+
+@pytest.mark.parametrize(
+    "status,headers,exc",
+    [
+        (401, {}, UpstreamAuth),
+        (403, {}, UpstreamAuth),
+        (400, {}, UpstreamBadRequest),
+        (404, {}, UpstreamBadRequest),
+        (429, {"retry-after": "17"}, UpstreamRateLimited),
+        (529, {}, UpstreamOverloaded),
+        (500, {}, UpstreamUnavailable),
+        (503, {}, UpstreamUnavailable),
+    ],
+)
+async def test_http_status_maps_to_its_own_exception(status, headers, exc):
+    resp = httpx.Response(status, headers=headers, json={"error": {"message": "nope"}})
+    a = AnthropicAdapter("https://x", "k", "m", client_with(lambda r: resp))
+    with pytest.raises(UpstreamUnavailable) as info:
+        await a.complete([{"role": "user", "content": "hi"}])
+    assert type(info.value) is exc  # exact class: each one has its own metric kind and HTTP status
+
+
+async def test_rate_limit_keeps_the_upstream_retry_after_and_ignores_a_bad_one():
+    for header, expected in (("17", 17), ("Wed, 21 Oct 2026 07:28:00 GMT", None), ("", None)):
+        resp = httpx.Response(429, headers={"retry-after": header})
+        a = AnthropicAdapter("https://x", "k", "m", client_with(lambda r, resp=resp: resp))
+        with pytest.raises(UpstreamRateLimited) as info:
+            await a.complete([{"role": "user", "content": "hi"}])
+        assert info.value.retry_after == expected

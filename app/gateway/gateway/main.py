@@ -22,7 +22,7 @@ from prometheus_client import (
     Histogram,
     generate_latest,
 )
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from starlette.types import ASGIApp, Receive, Scope, Send
 from starlette.types import Message as AsgiMessage
 
@@ -34,6 +34,10 @@ from .upstream import (
     AnthropicAdapter,
     MockAdapter,
     Upstream,
+    UpstreamAuth,
+    UpstreamBadRequest,
+    UpstreamOverloaded,
+    UpstreamRateLimited,
     UpstreamRefused,
     UpstreamTimeout,
     UpstreamUnavailable,
@@ -41,29 +45,39 @@ from .upstream import (
 
 MAX_MESSAGE_CHARS = 20_000
 MAX_TOTAL_CHARS = 100_000  # bounds the work one request can cause in the guardrails
-MAX_BODY_BYTES = (
-    1 << 20
-)  # 1 MiB: room for 100,000 characters in any encoding, far below the pod's memory limit
-REQUEST_ID = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+# 1 MiB: room for 100,000 characters in any encoding, far below the pod's memory limit.
+MAX_BODY_BYTES = 1 << 20
+# Used with fullmatch: "$" would also accept a trailing newline.
+REQUEST_ID = re.compile(r"[A-Za-z0-9._-]{1,64}")
+RETRY_AFTER_DEFAULT_S = 5  # sent with a 429 when the upstream did not say how long to wait
+RETRY_AFTER_MAX_S = 120
 
 # Upstream failure -> (kind used in metrics and the error code, HTTP status).
 UPSTREAM_FAILURES: dict[type[Exception], tuple[str, int]] = {
     UpstreamTimeout: ("timeout", 504),
     UpstreamUnavailable: ("unavailable", 502),
+    UpstreamAuth: ("auth", 502),  # our credentials were rejected: an operator problem, not an outage
+    UpstreamBadRequest: ("bad_request", 502),
+    UpstreamRateLimited: ("rate_limited", 429),  # passed through, with Retry-After
+    UpstreamOverloaded: ("overloaded", 503),
     UpstreamRefused: ("refused", 502),
 }
 
 
 class Message(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     role: str = Field(pattern="^(system|user|assistant)$")
     content: str = Field(max_length=MAX_MESSAGE_CHARS)
 
 
 class ChatRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # a misspelt field is an error, not silently ignored
     messages: list[Message] = Field(min_length=1, max_length=50)
 
     @model_validator(mode="after")
     def _bounded(self) -> ChatRequest:
+        if not any(m.role == "user" for m in self.messages):
+            raise ValueError("at least one message must have role 'user'")
         if sum(len(m.content) for m in self.messages) > MAX_TOTAL_CHARS:
             raise ValueError(f"total message length exceeds {MAX_TOTAL_CHARS} characters")
         return self
@@ -108,9 +122,8 @@ class BodyLimit:
             if not tripped:
                 await send(message)
             elif message["type"] == "http.response.start":
-                await self.refuse(Request(scope))(
-                    scope, receive, send
-                )  # sends the whole 413; the app's error is dropped
+                # Sends the whole 413; the app's own error response is dropped.
+                await self.refuse(Request(scope))(scope, receive, send)
 
         try:
             await self.app(scope, counting_receive, guarded_send)
@@ -153,12 +166,16 @@ class Metrics:
 def _request_id(request: Request) -> str:
     """Client-supplied X-Request-ID if it is short and boring, else a fresh one (it ends up in logs and headers)."""
     given = request.headers.get("x-request-id", "")
-    return given if REQUEST_ID.match(given) else uuid.uuid4().hex[:16]
+    return given if REQUEST_ID.fullmatch(given) else uuid.uuid4().hex[:16]
 
 
-def _reply(rid: str, policy_version: str, status: int, body: dict[str, Any]) -> JSONResponse:
+def _reply(
+    rid: str, policy_version: str, status: int, body: dict[str, Any], headers: dict[str, str] | None = None
+) -> JSONResponse:
     return JSONResponse(
-        body, status_code=status, headers={"X-Request-ID": rid, "X-Policy-Version": policy_version}
+        body,
+        status_code=status,
+        headers={"X-Request-ID": rid, "X-Policy-Version": policy_version, **(headers or {})},
     )
 
 
@@ -210,6 +227,7 @@ def create_app(
         decision: str,
         body: dict[str, Any],
         level: int = logging.INFO,
+        headers: dict[str, str] | None = None,
         **log_fields: Any,
     ) -> JSONResponse:
         """Count, log and answer one chat request: the single place a request's outcome is recorded."""
@@ -226,7 +244,11 @@ def create_app(
             },
         )
         return _reply(
-            rid, policy_version, status, {"request_id": rid, "policy_version": policy_version, **body}
+            rid,
+            policy_version,
+            status,
+            {"request_id": rid, "policy_version": policy_version, **body},
+            headers,
         )
 
     @app.exception_handler(RequestValidationError)
@@ -280,7 +302,9 @@ def create_app(
         rid = _request_id(request)
         pol: Policy | None = request.app.state.policy
         if pol is None:
-            return _reply(rid, "-", 503, {"request_id": rid, "error": "policy_not_loaded"})
+            return respond(
+                rid, "-", 503, "policy_not_loaded", {"error": "policy_not_loaded"}, level=logging.ERROR
+            )
 
         # Regex work is CPU-bound: keep it off the event loop so /healthz stays responsive.
         res = await run_in_threadpool(check_input, [m.model_dump() for m in req.messages], pol)
@@ -305,6 +329,10 @@ def create_app(
             kind, status = UPSTREAM_FAILURES[type(exc)]
             metrics.upstream_errors.labels(kind).inc()
             # The raw exception text stays in the log; the caller gets only the class of failure.
+            headers = None
+            if isinstance(exc, UpstreamRateLimited):
+                wait = exc.retry_after or RETRY_AFTER_DEFAULT_S
+                headers = {"Retry-After": str(min(wait, RETRY_AFTER_MAX_S))}
             return respond(
                 rid,
                 pol.version,
@@ -312,6 +340,7 @@ def create_app(
                 "upstream_error",
                 {"error": f"upstream_{kind}"},
                 level=logging.WARNING,
+                headers=headers,
                 error=kind,
                 detail=str(exc)[:200],
                 upstream_ms=round((time.perf_counter() - t0) * 1000),

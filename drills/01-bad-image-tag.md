@@ -2,6 +2,8 @@
 
 Inject: `drills/01-bad-image-tag.sh`   Undo: `drills/01-bad-image-tag.sh restore`
 
+In the captures, a line starting with `$ ` is either a command that was run or, when it is not a typeable command (for example `$ managedFields after restore`), a label for the step; the output under it is what the real commands printed.
+
 ## Symptom
 After an upgrade, `helm upgrade` returns but the new gateway pod never becomes Ready. `kubectl rollout status` hangs.
 Existing traffic keeps working, because the Deployment uses `maxUnavailable: 0` and keeps the old pods running (in the capture below
