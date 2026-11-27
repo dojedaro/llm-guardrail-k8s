@@ -1,7 +1,7 @@
 name: ci
 
-# Not yet run on GitHub (the repo has not been pushed). Every step below is a command that was run locally; see
-# docs/EVIDENCE.md for the dated outputs. Action versions are major tags and should be re-checked on first push.
+# Every step is a command that was run locally; docs/EVIDENCE.md has the dated output. Third-party actions are pinned
+# to a commit (the comment names the release line); tools that run as containers are pinned by digest.
 
 on:
   push:
@@ -14,53 +14,57 @@ permissions:
 env:
   HELM_VERSION: v4.3.2        # the version the chart was tested with (Helm 4 server-side apply, --rollback-on-failure)
   KIND_VERSION: v0.33.0
-  KIND_NODE_IMAGE: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
-  CALICO_VERSION: v3.28.2
+  SHELLCHECK_IMAGE: koalaman/shellcheck@sha256:bb596a0d169b85ddd81d8b6d3a2ff6d5baf5fca10b97f575ebc647c3dff62b3d
 
 jobs:
   python:
     # Python 3.12 and the gateway's pinned requirements: the same interpreter and dependencies as the image.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
       - run: pip install -r app/gateway/requirements.txt -r requirements-dev.txt
+      - name: Every shell script is executable in git (a script committed from Windows loses the bit)
+        run: |
+          bad="$(git ls-files -s -- '*.sh' | grep -v '^100755' || true)"
+          [ -z "$bad" ] || { echo "not executable:"; echo "$bad"; exit 1; }
       - run: ruff check .
       - run: ruff format --check .
+      - run: mypy
       - run: pytest tests/unit -q
+      - name: Guardrail corpus must not regress (eval/baseline.json)
+        run: python scripts/eval_guardrails.py --in-process --gate
       - run: tests/scripts/test-redact.sh
+      - name: shellcheck
+        run: docker run --rm -v "$PWD:/mnt" -w /mnt "$SHELLCHECK_IMAGE" -x scripts/*.sh drills/*.sh tests/scripts/*.sh
 
   chart:
     runs-on: ubuntu-latest
     defaults:
       run:
-        shell: bash   # bash with -eo pipefail, so a failing `helm template | kubeconform` fails the step
+        shell: bash   # bash with -eo pipefail, so a failing step inside a pipeline fails the job
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
-      - run: pip install pyyaml==6.0.2
-      - uses: azure/setup-helm@v4
+      - run: pip install pyyaml==6.0.4
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
         with:
           version: ${{ env.HELM_VERSION }}
       # helm lint + template for every values file, strict duplicate-key check, kubeconform -strict (container image),
-      # and the "bad values must be rejected" tests.
-      - run: PYBIN=python scripts/chart-check.sh
+      # and the "bad values must be rejected, for the stated reason" tests.
+      - run: scripts/chart-check.sh
 
   image-scan:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - run: docker build -t llm-guardrail/gateway:ci app/gateway
-      - uses: aquasecurity/trivy-action@0.28.0
-        with:
-          image-ref: llm-guardrail/gateway:ci
-          severity: CRITICAL,HIGH
-          ignore-unfixed: true
-          exit-code: "1"
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      # Builds both images and scans them with Trivy from a container image pinned by digest (scripts/scan-images.sh).
+      - run: IMAGE_LOADER=none scripts/build-images.sh
+      - run: scripts/scan-images.sh
 
   e2e:
     needs: [python, chart]
@@ -69,19 +73,20 @@ jobs:
     env:
       REQUIRE_CLUSTER: "1"   # a missing cluster fails the integration tests instead of skipping them
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
       - run: pip install -r app/gateway/requirements.txt -r requirements-dev.txt
-      - uses: azure/setup-helm@v4
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
         with:
           version: ${{ env.HELM_VERSION }}
-      - uses: helm/kind-action@v1
+      - uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1
         with:
           install_only: true
           version: ${{ env.KIND_VERSION }}
-      # Creates the 3-node Calico cluster, installs ingress-nginx, builds both images and loads them into kind.
+      # Creates the 3-node Calico cluster from the pinned node image, installs ingress-nginx, builds both images
+      # and loads them into kind.
       - name: Cluster
         run: CNI=calico scripts/cluster-up.sh
       - name: Install chart
@@ -96,12 +101,12 @@ jobs:
       - run: drills/06-networkpolicy-enforcement.sh
       - name: Upgrade, image upgrade and rollback
         run: scripts/upgrade-rollback-demo.sh
-      - name: Guardrail evaluation (measurement only, prints false-positive / false-negative rates)
-        run: python scripts/eval_guardrails.py --json eval-results.json
+      - name: Guardrail evaluation against the deployed gateway (fails if a split has more misses than eval/baseline.json)
+        run: python scripts/eval_guardrails.py --gate --json eval-results.json
       - name: Support bundle
         if: always()
         run: scripts/collect-diagnostics.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
           name: diagnostics-and-eval
