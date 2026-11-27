@@ -57,9 +57,7 @@ def rrn_valid(front: str, back: str) -> bool:
 # "a.a.a.a." (0.4 s per 20 kB measured), and guardrails sit on the request path. There is no lookbehind:
 # with one, a local part longer than 64 characters (or glued to a long token) was never matched at all.
 # Now the 64 characters before the "@" are redacted, which is the longest local part RFC 5321 allows.
-EMAIL = re.compile(
-    r"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}\.[A-Za-z]{2,24}"
-)
+EMAIL = re.compile(r"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}\.[A-Za-z]{2,24}")
 # A run of digit groups separated by one or two spaces, dots, hyphens or line breaks, however long. Card detection then tries
 # Luhn on runs of 1-5 consecutive groups, so "order 12345 4111 1111 1111 1111" and a card after a
 # date, a phone number or any amount of other digits are still found. Linear: a separator is required
@@ -221,7 +219,9 @@ INJECTION_RULES: tuple[tuple[str, int, re.Pattern[str]], ...] = (
             # "ignore your instructions", "disregard your system prompt", "stop following your rules"
             r"|\b" + _DROP + r"\s+(?:all\s+|any\s+)?(?:of\s+)?your\s+" + _OWN_PROMPT + r"\b"
             # "ignore the system prompt"
-            r"|\b" + _DROP + r"\s+(?:all\s+|any\s+)?(?:the\s+)?(?:system|developer)\s+(?:prompt|instructions?)\b"
+            r"|\b"
+            + _DROP
+            + r"\s+(?:all\s+|any\s+)?(?:the\s+)?(?:system|developer)\s+(?:prompt|instructions?)\b"
             # "ignore all instructions above"
             r"|\b(?:ignore|disregard|forget)\s+(?:all\s+|any\s+)?(?:the\s+|your\s+)?"
             + _TARGET

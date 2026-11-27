@@ -16,6 +16,26 @@ class UpstreamUnavailable(Exception):
     """Connection refused, DNS failure, or upstream returned an error -> HTTP 502."""
 
 
+class UpstreamAuth(UpstreamUnavailable):
+    """Upstream rejected our credentials (HTTP 401/403): a configuration problem, not an outage -> HTTP 502."""
+
+
+class UpstreamBadRequest(UpstreamUnavailable):
+    """Upstream rejected the request itself (HTTP 400, other 4xx): a gateway or adapter bug -> HTTP 502."""
+
+
+class UpstreamRateLimited(UpstreamUnavailable):
+    """Upstream rate limit (HTTP 429) -> HTTP 429 with Retry-After, so the caller can back off."""
+
+    def __init__(self, message: str, retry_after: int | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+class UpstreamOverloaded(UpstreamUnavailable):
+    """Upstream says it is overloaded (HTTP 529, Anthropic) -> HTTP 503."""
+
+
 class UpstreamRefused(Exception):
     """The model declined to answer (Anthropic stop_reason "refusal") -> HTTP 502, reported as its own kind."""
 
@@ -43,8 +63,24 @@ async def _post(client: httpx.AsyncClient, url: str, **kw: Any) -> httpx.Respons
     except httpx.TransportError as exc:  # connect error, DNS failure, reset...
         raise UpstreamUnavailable(f"{type(exc).__name__}: {exc}") from exc
     if resp.status_code >= 400:
-        raise UpstreamUnavailable(f"upstream returned HTTP {resp.status_code}{_error_hint(resp)}")
+        raise _status_error(resp)
     return resp
+
+
+def _status_error(resp: httpx.Response) -> UpstreamUnavailable:
+    """Map an upstream error status to its own exception, so metrics and the caller can tell them apart."""
+    code = resp.status_code
+    message = f"upstream returned HTTP {code}{_error_hint(resp)}"
+    if code in (401, 403):
+        return UpstreamAuth(message)
+    if code == 429:
+        header = resp.headers.get("retry-after", "")
+        return UpstreamRateLimited(message, int(header) if header.isdigit() else None)
+    if code == 529:
+        return UpstreamOverloaded(message)
+    if code < 500:
+        return UpstreamBadRequest(message)
+    return UpstreamUnavailable(message)
 
 
 def _error_hint(resp: httpx.Response) -> str:

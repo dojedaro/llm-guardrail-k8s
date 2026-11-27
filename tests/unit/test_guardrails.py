@@ -437,7 +437,18 @@ def _best_time(payload: str, repeat: int = 3) -> float:
 
 @pytest.mark.parametrize(
     "unit",
-    ["a.", "a-", "1 ", "1.", "1" + NL, "x" * 70 + "@", "sk-", "-----BEGIN PRIVATE KEY----- ", "a@b.co ", "4111 1111 1111 1112 "],
+    [
+        "a.",
+        "a-",
+        "1 ",
+        "1.",
+        "1" + NL,
+        "x" * 70 + "@",
+        "sk-",
+        "-----BEGIN PRIVATE KEY----- ",
+        "a@b.co ",
+        "4111 1111 1111 1112 ",
+    ],
 )
 def test_guardrails_scale_linearly_on_adversarial_input(unit):
     """Quadratic behaviour has bitten these regexes before ("a.a.a." and a pile of short emails took seconds).
